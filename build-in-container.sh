@@ -12,7 +12,11 @@
 #
 #   ./build-in-container.sh
 #   RUNTIME=docker ./build-in-container.sh
-#   CPUS=8 MEMORY=8g ./build-in-container.sh
+#   IMAGE=docker.io/archlinux:base-devel ./build-in-container.sh
+#
+# No CPU or memory limits are applied to the container: under rootless podman the
+# cgroup controllers are not delegated and --memory fails during container init. The
+# build VM's own size is set in the Packer HCL (-m 2048M), which is what matters.
 #
 # KVM NOTE: passing /dev/kvm in is the entire reason to prefer this over CI. Without it
 # the build still works but runs under software emulation, which is slower — usable, but
@@ -20,8 +24,6 @@
 set -euo pipefail
 
 RUNTIME="${RUNTIME:-}"
-CPUS="${CPUS:-4}"
-MEMORY="${MEMORY:-4g}"
 IMAGE="${IMAGE:-docker.io/archlinux:latest}"
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -60,10 +62,21 @@ mkdir -p build_archlinux/output
 # including /tmp, which exists in every image — so the validation is not seeing the
 # container's filesystem the way one would expect. The shell does its own mkdir/cd
 # below, which removes the dependency entirely.
+#
+# NOTE: --memory and --cpus are also deliberately absent. Under ROOTLESS podman the
+# cgroup controllers are not delegated to the user slice, so --memory fails during
+# container init before anything runs:
+#   error setting cgroup config for procHooks process: openat2
+#   .../memory.swap.max: no such file or directory
+# Neither flag changes the image that gets built, and QEMU's own -m (2048M, set in the
+# HCL) is what actually bounds the build VM. Dropping them costs nothing and removes a
+# whole class of rootless failure.
+#
+# --security-opt label=disable: with SELinux enforcing, the bind mounts need relabelling
+# or the container cannot read /src.
 "$RUNTIME" run --rm -i \
     "${DEVICES[@]}" \
-    --cpus "$CPUS" \
-    --memory "$MEMORY" \
+    --security-opt label=disable \
     -v "$REPO_DIR:/src:ro" \
     -v "$REPO_DIR/build_archlinux/output:/out" \
     "$IMAGE" \
