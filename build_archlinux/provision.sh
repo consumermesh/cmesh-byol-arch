@@ -37,7 +37,8 @@ pacman -S --noconfirm --needed \
 # Fail the build early if any tool the installer shells out to is missing, rather than
 # discovering it on a customer's server with the disks already wiped.
 for tool in cryptsetup mdadm sgdisk mkfs.ext4 mkfs.vfat rsync tar zstd \
-            systemd-cryptenroll grub-install grub-mkconfig mkinitcpio blkid findmnt; do
+            systemd-cryptenroll grub-install grub-mkconfig mkinitcpio blkid findmnt \
+            mkswap fallocate chattr; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "FATAL: required tool '$tool' is missing from the image" >&2
         exit 1

@@ -39,7 +39,7 @@ nvme0n1                              nvme1n1
 │                      ├─ md2 (raid1, ext4) → /boot         │
 └─p3  ~893G LUKS2 ─┐   │            └─p3  ~893G LUKS2 ─┐    │
    └─ cryptroot0 ──┴───┴──── md3 (raid1, ext4) ────────┴────┘
-                                  → /
+                                  → /  (and /swap/swapfile inside it)
 ```
 
 **LUKS sits *under* RAID, not over it.** This is the single most important decision in
@@ -59,6 +59,36 @@ you bought the second disk for. If you take one thing from this repo, take that.
 FAT32 directly — encrypting either means a passphrase at the bootloader plus a real risk
 of an unbootable host. Neither holds PHI; the kernel and initramfs are not the sensitive
 part.
+
+## Swap, and why it is a file
+
+Swap **is** configured, as `/swap/swapfile` — a file inside the encrypted root, sized to
+`min(RAM/2, 8 GiB)` with a 4 GiB floor.
+
+**Why not a swap partition.** Swap holds whatever the kernel evicted from RAM: on this
+host that is customer records, chat transcripts, database pages, and — because the LUKS
+mappings are open — potentially key material. An unencrypted swap partition would quietly
+undo the encryption-at-rest property the rest of this layout exists to provide. A swap
+file on the encrypted root inherits that encryption for free. The other correct option is
+a dedicated LUKS swap partition with a random key per boot (`crypttab` option `swap`);
+that is more moving parts for no extra protection here, because the root is already
+encrypted under the same header.
+
+**Why swap at all.** Without it, memory pressure on a database server invokes the OOM
+killer and terminates postgres. With it, cold anonymous pages are evicted and the process
+survives. Running with no swap is a deliberate choice only when memory is provably
+oversized for the workload — not a default worth taking silently.
+
+The entry uses `pri=0` and is deliberately given no `resume=` offset, so the kernel never
+treats it as a hibernation target.
+
+## Hibernation is refused
+
+`systemctl hibernate` will not work on this image, and that is intentional. A hibernation
+image is a complete copy of decrypted RAM written to disk; on a PHI host it is a
+disclosure risk with no operational justification when suspend-to-idle covers the same
+need. If you want it anyway, you must size swap to at least RAM and add `resume=` and
+`resume_offset=` to the kernel command line — and you should write down why.
 
 ## Why not ZFS
 
@@ -219,6 +249,11 @@ lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
 blkid /dev/nvme0n1p3                  # TYPE="crypto_LUKS"
 cat /proc/mdstat                      # md2 and md3 both [UU]
 findmnt -no SOURCE /
+
+# Swap is on the encrypted volume, not a bare partition:
+swapon --show                         # NAME must be /swap/swapfile
+findmnt -no SOURCE -T /swap/swapfile  # must resolve through md3
+ls -l /swap/swapfile                  # 0600 root:root
 ```
 
 Then confirm it survives an unattended reboot, which is the property that actually
