@@ -12,16 +12,35 @@ name: Builder
 
 on:
   push:
+    branches: ["**"]
     tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  # Runs first and fails fast. These suites cost seconds; the image build costs ~12
+  # minutes and needs QEMU. Every defect in this project so far -- the deploy hook's fatal
+  # assertion, its failed ESP detection, the installer's systemd ordering -- would have
+  # been caught here, and each one instead cost an image upload and a reinstall to
+  # diagnose from rescue mode.
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the deploy hook, unit and parser tests
+        run: ./test/run-all.sh
+
   build:
+    needs: test
     # The image is built by booting QEMU with KVM, so a Linux runner with /dev/kvm is
     # required. The GitHub-hosted ubuntu runners provide it.
+    #
+    # Only tag builds publish a release, so a branch push runs the tests and stops there.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
