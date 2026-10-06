@@ -5,30 +5,26 @@
 #
 # The hook's failure modes are silent. OVHcloud runs it chrooted on the target and reports
 # only "the script did not end properly" when it exits non-zero -- no line, no message, no
-# output. The first version of this hook combined `set -euo pipefail` with several
-# assertions that were individually reasonable and collectively fatal, and one of them
-# fired: the deployment aborted at step 14/17, the ESP had already been formatted, and the
-# only way to see why was to boot rescue and read the disk. Debugging it that way costs a
-# full image upload and a reinstall per attempt.
+# output. Diagnosing it from there costs a full image upload and a reinstall per attempt,
+# and has done so four times.
 #
-# So the hook is exercised here instead. The subject under test is EXTRACTED FROM
-# provision.sh rather than kept as a duplicate, because a copy would drift from what ships
-# and the drift would be invisible until a deploy failed.
+# So the hook is exercised here. The subject under test is EXTRACTED FROM provision.sh
+# rather than kept as a duplicate, because a copy would drift from what ships and the drift
+# would be invisible until a deploy failed.
 #
 # HOW IT WORKS
 #
-# Absolute paths are rewritten into a sandbox directory and every command that inspects
-# the machine (lsblk, findmnt, mount, grub-install, mkinitcpio) is stubbed, so the test
-# asserts CONTROL FLOW:
+# Absolute paths are rewritten into a sandbox and every command that inspects the machine
+# is stubbed, so the test asserts CONTROL FLOW. The stubs can fail on demand, and each
+# ESP-detection strategy can be disabled independently, so the fallback chain is tested
+# rather than the happy path alone.
 #
-#   * a bootloader on the ESP is the only thing that may fail the deployment
-#   * everything else -- initramfs rebuild, grub.cfg, module injection -- is logged, and
-#     a failure there leaves the deploy successful
-#   * the log lands on the deployed root, because that is the only diagnostic that
-#     survives the reboot and is readable from rescue mode
-#
-# The stubs deliberately can fail on demand (STUB_*_FAIL) so the failure paths are
-# tested, not just the happy path.
+# Regression this guards: the second hook detected the ESP itself with
+# `lsblk -rpnlo NAME,PARTTYPE` and matched the type GUID. That returned nothing on the
+# target, the fallback returned nothing either, grub-install was skipped and the deploy
+# aborted -- while the ESP sat mounted at /boot/efi the entire time. STUB_LSBLK_EMPTY
+# reproduces exactly that, and the first detection tests assert the hook finds the ESP
+# anyway.
 #
 # Usage: test/hook-test.sh
 set -uo pipefail
@@ -36,8 +32,13 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 PROVISION="$REPO/build_archlinux/provision.sh"
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# HOOK_TEST_WORKDIR keeps the sandbox around for inspection after a failure.
+WORK="$(mktemp -d ${HOOK_TEST_WORKDIR:+-p "$HOOK_TEST_WORKDIR"} 2>/dev/null || mktemp -d)"
+if [ -z "${HOOK_TEST_KEEP:-}" ]; then
+    trap 'rm -rf "$WORK"' EXIT
+else
+    trap 'echo "workdir kept: $WORK"' EXIT
+fi
 
 SB="$WORK/sandbox"
 BIN="$WORK/bin"
@@ -57,7 +58,6 @@ check() { # check <description> <expected> <actual>
 
 ### Extract the hook from provision.sh ###
 
-# The hook is a quoted heredoc, so it is reproduced verbatim in the built image.
 awk "/^cat > \/root\/\.ovh\/make_image_bootable\.sh <</{f=1;next} /^HOOK\$/{f=0} f" \
     "$PROVISION" > "$WORK/hook.sh"
 
@@ -76,18 +76,24 @@ echo "extracted $(wc -l < "$WORK/hook.sh") lines of hook from $(basename "$PROVI
 sed \
     -e "s#/boot/ovh-make-bootable.log#$SB/boot/ovh-make-bootable.log#g" \
     -e "s#/var/log#$SB/var/log#g" \
+    -e "s#/proc/mounts#$SB/proc/mounts#g" \
     -e "s#/proc/partitions#$SB/proc/partitions#g" \
     -e "s#/sys/firmware/efi#$SB/sys-firmware-efi#g" \
     -e "s#/etc/mkinitcpio.conf#$SB/etc/mkinitcpio.conf#g" \
     -e "s#/etc/fstab#$SB/etc/fstab#g" \
     -e "s#/mnt/cmesh-esp#$SB/mnt/cmesh-esp#g" \
-    -e "s#/boot#$SB/boot#g" \
+    -e "s#/boot/efi#$SB/boot/efi#g" \
+    -e "s#/boot/grub#$SB/boot/grub#g" \
+    -e "s#/boot/initramfs-linux.img#$SB/boot/initramfs-linux.img#g" \
     "$WORK/hook.sh" > "$WORK/hook-sandboxed.sh"
 
 ### Stubs ###
 
+# lsblk: STUB_LSBLK_EMPTY reproduces the real failure -- the PARTTYPE column returns
+# nothing even though the ESP exists and is mounted.
 cat > "$BIN/lsblk" <<EOF
 #!/bin/bash
+if [ -n "\${STUB_LSBLK_EMPTY:-}" ]; then exit 0; fi
 case "\$*" in
   *PARTTYPE*) printf '/dev/nvme0n1p1 c12a7328-f81f-11d2-ba4b-00a0c93ec93b\n/dev/nvme0n1p2 4f68bce3-e8cd-4db1-96e7-fbcaf984b709\n' ;;
   *FSTYPE*)   printf '/dev/nvme0n1p1 vfat\n' ;;
@@ -96,19 +102,51 @@ esac
 exit 0
 EOF
 
+# blkid: "-o value -s TYPE <dev>" is the ESP validation; "-o device -t ..." is a discovery
+# strategy. STUB_BLKID_NONE disables both, forcing the hook to declare it found nothing.
+cat > "$BIN/blkid" <<EOF
+#!/bin/bash
+[ -n "\${STUB_BLKID_NONE:-}" ] && exit 2
+mode=""; field=""; query=""; arg=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) shift; mode="\$1" ;;
+    -s) shift; field="\$1" ;;
+    -t) shift; query="\$1" ;;
+    *)  arg="\$1" ;;
+  esac
+  shift
+done
+if [ "\$mode" = "value" ] && [ "\$field" = "TYPE" ]; then
+  echo "\${STUB_BLKID_TYPE:-vfat}"; exit 0
+fi
+if [ "\$mode" = "device" ]; then
+  [ -n "\${STUB_BLKID_DEV:-}" ] && echo "\$STUB_BLKID_DEV"
+  exit 0
+fi
+exit 2
+EOF
+
+# findmnt answers both "what is mounted at X" and "is device D mounted".
 cat > "$BIN/findmnt" <<EOF
 #!/bin/bash
-if [ "\$1" = "-rn" ] && [ "\$2" = "-S" ]; then echo "$SB/root"; exit 0; fi
+[ -n "\${STUB_FINDMNT_EMPTY:-}" ] && exit 1
+if [ "\$1" = "-rn" ] && [ "\$2" = "-o" ] && [ "\$3" = "SOURCE" ]; then
+  echo "\${STUB_FINDMNT_SOURCE:-/dev/nvme1n1p1}"; exit 0
+fi
+if [ "\$1" = "-rn" ] && [ "\$2" = "-S" ]; then echo "$SB/boot/efi"; exit 0; fi
 echo "$SB/root ext4 rw"
 exit 0
 EOF
 
-# Nothing is mounted in the sandbox; mount itself is a no-op that reports success so the
-# hook's bind-mount fallback path is exercised.
+# mountpoint: STUB_NO_MOUNTPOINT makes /boot/efi report as not mounted, forcing the hook
+# past strategy 1 and onto the fallbacks.
 cat > "$BIN/mountpoint" <<'EOF'
 #!/bin/bash
-exit 1
+[ -n "${STUB_NO_MOUNTPOINT:-}" ] && exit 1
+exit 0
 EOF
+
 printf '#!/bin/bash\necho "mount(stub): $*"\nexit 0\n' > "$BIN/mount"
 printf '#!/bin/bash\necho "umount(stub): $*"\nexit 0\n' > "$BIN/umount"
 
@@ -134,21 +172,26 @@ cat > "$BIN/mkinitcpio" <<EOF
 #!/bin/bash
 echo "mkinitcpio(stub): \$*"
 [ -n "\${STUB_MKINITCPIO_FAIL:-}" ] && exit 1
-if [ -n "\${STUB_MKINITCPIO_EMPTY:-}" ]; then
-    printf 'fake cpio with no storage modules' > $SB/boot/initramfs-linux.img
-else
-    printf 'fake cpio nvme raid1' > $SB/boot/initramfs-linux.img
-fi
+printf 'fake cpio nvme raid1' > $SB/boot/initramfs-linux.img
 exit 0
 EOF
 chmod +x "$BIN"/*
 
 ### Harness ###
 
+# The hook cannot be given real block devices here -- mknod is refused even inside a user
+# namespace on this host -- so this flag relaxes is_esp()'s [ -b ] check and nothing else.
+# It is unset in production.
+export CMESH_BYOL_TEST_NONBLOCK=1
+
 reset_env() {
     rm -rf "$SB/boot" "$SB/var/log" "$SB/mnt"
     mkdir -p "$SB/boot/efi" "$SB/var/log" "$SB/mnt"
     printf 'MODULES=()\nHOOKS=(base systemd)\n' > "$SB/etc/mkinitcpio.conf"
+    # Default world: the ESP is mounted at /boot/efi, and lsblk is as unhelpful as it was
+    # on the real target.
+    printf '/dev/nvme1n1p1 %s/boot/efi vfat rw,relatime 0 0\n' "$SB" > "$SB/proc/mounts"
+    printf 'LABEL=EFI_SYSPART %s/boot/efi vfat defaults 0 1\n' "$SB" > "$SB/etc/fstab"
 }
 
 RC=0
@@ -165,45 +208,62 @@ run() { # run <label> [KEY=VALUE ...]
 }
 
 echo
+echo "finding the ESP -- the regression that cost a deployment"
+echo "(in every case below lsblk's PARTTYPE column is empty, exactly as on the target)"
+run esp_mounted STUB_LSBLK_EMPTY=1
+check "strategy 1 (/boot/efi mounted): exit 0"  0 "$RC"
+check "  loader written"                        1 "$([ -f "$SB/boot/efi/EFI/BOOT/BOOTX64.EFI" ] && echo 1 || echo 0)"
+check "  log names the method"                  1 "$(grep -q 'is mounted on /dev/nvme1n1p1' "$LOG" && echo 1 || echo 0)"
+check "  no bogus 'not found' warning"          0 "$(grep -c 'no EFI System Partition found' "$LOG")"
+
+run esp_blkid STUB_LSBLK_EMPTY=1 STUB_NO_MOUNTPOINT=1 STUB_FINDMNT_SOURCE= STUB_BLKID_DEV=/dev/nvme1n1p1
+check "strategy 2/3 (blkid): exit 0"            0 "$RC"
+check "  loader written"                        1 "$([ -f "$SB/boot/efi/EFI/BOOT/BOOTX64.EFI" ] && echo 1 || echo 0)"
+check "  log names a method"                    1 "$(grep -qE 'ESP candidates \((vfat partitions in|blkid|fstab)' "$LOG" && echo 1 || echo 0)"
+check "  log names the device"                  1 "$(grep -q 'candidates.*: /dev/nvme1n1p1' "$LOG" && echo 1 || echo 0)"
+
+run esp_none STUB_LSBLK_EMPTY=1 STUB_NO_MOUNTPOINT=1 STUB_FINDMNT_EMPTY=1 STUB_BLKID_NONE=1
+check "no ESP by any method: exit 1"            1 "$RC"
+check "  says all five were tried"              1 "$(grep -q 'no EFI System Partition found by ANY of five methods' "$LOG" && echo 1 || echo 0)"
+check "  names the detection method as none"    1 "$(grep -q 'detection method: none' "$OUT" && echo 1 || echo 0)"
+
+echo
 echo "the bootloader is the only fatal step"
 run grubfail STUB_GRUB_FAIL=1
-check "exits non-zero"                1 "$RC"
-check "names the missing loader"      1 "$(grep -q 'no boot path' "$OUT" && echo 1 || echo 0)"
-check "records the failed step"       1 "$(grep -q 'FAIL grub-install' "$LOG" && echo 1 || echo 0)"
+check "exits non-zero"                          1 "$RC"
+check "names the missing loader"                1 "$(grep -q 'No boot path' "$OUT" && echo 1 || echo 0)"
+check "records the failed step"                 1 "$(grep -q 'FAIL grub-install' "$LOG" && echo 1 || echo 0)"
 
 echo
 echo "nothing else may fail the deployment"
 run mkconfigfail STUB_MKCONFIG_FAIL=1
-check "grub-mkconfig failure: exit 0" 0 "$RC"
-check "  loader still written"        1 "$([ -f "$SB/boot/efi/EFI/BOOT/BOOTX64.EFI" ] && echo 1 || echo 0)"
-check "  failure recorded"            1 "$(grep -q 'FAIL grub-mkconfig' "$LOG" && echo 1 || echo 0)"
+check "grub-mkconfig failure: exit 0"           0 "$RC"
+check "  loader still written"                  1 "$([ -f "$SB/boot/efi/EFI/BOOT/BOOTX64.EFI" ] && echo 1 || echo 0)"
+check "  failure recorded"                      1 "$(grep -q 'FAIL grub-mkconfig' "$LOG" && echo 1 || echo 0)"
 
 run mkinitfail STUB_MKINITCPIO_FAIL=1
-check "mkinitcpio failure: exit 0"    0 "$RC"
-check "  failure recorded"            1 "$(grep -q 'FAIL mkinitcpio -P' "$LOG" && echo 1 || echo 0)"
-check "  still reports success"       1 "$(grep -q 'bootloader installed' "$OUT" && echo 1 || echo 0)"
-
-run nowarncheck STUB_MKINITCPIO_EMPTY=1
-check "initramfs without modules"     1 "$(grep -qE 'does not contain:.*nvme' "$OUT" && echo 1 || echo 0)"
-check "  warns, does not fail"        0 "$RC"
+check "mkinitcpio failure: exit 0"              0 "$RC"
+check "  failure recorded"                      1 "$(grep -q 'FAIL mkinitcpio -P' "$LOG" && echo 1 || echo 0)"
+check "  still reports success"                 1 "$(grep -q 'bootloader installed' "$OUT" && echo 1 || echo 0)"
 
 echo
 echo "the happy path"
 run happy
-check "exits zero"                    0 "$RC"
-check "loader at the removable path"  1 "$([ -f "$SB/boot/efi/EFI/BOOT/BOOTX64.EFI" ] && echo 1 || echo 0)"
-check "loader at the bootloader id"   1 "$([ -f "$SB/boot/efi/EFI/cmesh/grubx64.efi" ] && echo 1 || echo 0)"
-check "grub.cfg generated"            1 "$([ -f "$SB/boot/grub/grub.cfg" ] && echo 1 || echo 0)"
-check "storage modules forced in"     1 "$(grep -q '^MODULES=(nvme raid1)' "$SB/etc/mkinitcpio.conf" && echo 1 || echo 0)"
-check "log written to deployed root"  1 "$([ -s "$LOG" ] && echo 1 || echo 0)"
-check "log survives as a summary"     1 "$(grep -q 'OK   grub-install' "$LOG" && echo 1 || echo 0)"
+check "exits zero"                              0 "$RC"
+check "loader at the removable path"            1 "$([ -f "$SB/boot/efi/EFI/BOOT/BOOTX64.EFI" ] && echo 1 || echo 0)"
+check "loader at the bootloader id"             1 "$([ -f "$SB/boot/efi/EFI/cmesh/grubx64.efi" ] && echo 1 || echo 0)"
+check "grub.cfg generated"                      1 "$([ -f "$SB/boot/grub/grub.cfg" ] && echo 1 || echo 0)"
+check "storage modules forced in"               1 "$(grep -q '^MODULES=(nvme raid1)' "$SB/etc/mkinitcpio.conf" && echo 1 || echo 0)"
+check "log written to deployed root"            1 "$([ -s "$LOG" ] && echo 1 || echo 0)"
+check "log carries a per-step summary"          1 "$(grep -q 'OK   grub-install' "$LOG" && echo 1 || echo 0)"
 
 echo
-echo "the mount table and partition layout are recorded for rescue-mode diagnosis"
-run happy2
-check "lsblk output captured"         1 "$(grep -q 'PARTTYPENAME\|c12a7328' "$LOG" && echo 1 || echo 0)"
-check "mount table captured"          1 "$(grep -q 'mount table' "$LOG" && echo 1 || echo 0)"
-check "fstab captured"                1 "$(grep -q 'fstab' "$LOG" && echo 1 || echo 0)"
+echo "rescue-mode diagnostic material is captured"
+run diag
+check "raw blkid output logged"                 1 "$(grep -q 'blkid (raw)' "$LOG" && echo 1 || echo 0)"
+check "vfat mounts logged"                      1 "$(grep -q 'mounts (vfat)' "$LOG" && echo 1 || echo 0)"
+check "fstab logged"                            1 "$(grep -q 'fstab' "$LOG" && echo 1 || echo 0)"
+check "mount table logged"                      1 "$(grep -q 'mount table' "$LOG" && echo 1 || echo 0)"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

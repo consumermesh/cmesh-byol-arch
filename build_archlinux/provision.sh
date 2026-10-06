@@ -165,12 +165,12 @@ ln -sf /etc/systemd/system/cmesh-byol-install.service \
 # nothing the build leaves on the ESP survives, and the machine cannot boot far enough to
 # run cmesh-byol-install until a loader exists. A no-op stub here is an unbootable server.
 #
-# The hook is exercised outside the image (see the hook test harness in the repo) because
-# its failure modes are silent: OVHcloud reports only "the script did not end properly",
-# with no output from the script at all. Read the hook's own log first when a deployment
-# does not boot -- it is written to the deployed root and survives the reboot:
+# The hook is exercised outside the image (see test/hook-test.sh) because its failure modes
+# are silent: OVHcloud reports only "the script did not end properly", with no output from
+# the script at all. Read the hook's own log first when a deployment does not boot -- it is
+# written to the deployed root and survives the reboot:
 #
-#   mount /dev/nvme0n1p2 /mnt && cat /mnt/var/log/ovh-make-bootable.log
+#   mount /dev/md3 /mnt && cat /mnt/var/log/ovh-make-bootable.log
 #
 # The hook deliberately does NOT touch the partition layout: it runs before the first
 # reboot, while the layout OVH just created is still the one cmesh-byol-install replaces.
@@ -193,30 +193,40 @@ cat > /root/.ovh/make_image_bootable.sh <<'HOOK'
 #
 # WHAT IT MUST NOT DO
 #
-# Fail the deployment over anything else. An earlier revision of this hook rebuilt the
-# initramfs and treated three "should never happen" assertions as fatal. One of them
-# fired, the deployer aborted at step 14/17, and the only diagnostic OVHcloud reported
-# was "the script did not end properly" -- no line number, no message, nothing. Both the
-# disk layout and the bootloader state were then unrecoverable without a rescue boot,
-# and the ESP had already been formatted, so the machine could not boot either way.
+# Fail the deployment over anything else. An earlier revision rebuilt the initramfs and
+# treated three "should never happen" assertions as fatal; one fired, the deployer
+# aborted, and OVHcloud reported only "the script did not end properly". Every step below
+# is best-effort and LOGGED, and this script exits 0 unless it cannot write a bootloader.
 #
-# The assertions were not wrong; making them fatal was. The initramfs is regenerated
-# twice more before it matters (by this hook's successor on first boot, and again by
-# cmesh-byol-install on the target), so failing a deployment over it buys nothing and
-# costs a full upload. Every step below is therefore best-effort and LOGGED, and this
-# script exits 0 unless it cannot write a bootloader at all.
+# FINDING THE ESP: DO NOT OVER-ENGINEER THIS
+#
+# The revision after that one failed for the opposite reason. It assumed nothing and
+# detected the ESP itself, with `lsblk -rpnlo NAME,PARTTYPE` matched against the ESP type
+# GUID -- and that returned NOTHING on the target, so the fallback ran, also returned
+# nothing, grub-install was skipped, and the deployment aborted. The log is unambiguous:
+#
+#   |---nvme1n1p1   511M vfat   EFI System   EFI_SYSPART /boot/efi
+#   cmesh-byol-bootloader: WARNING: no partition has the ESP type GUID
+#   cmesh-byol-bootloader: WARNING: no ESP found at all; GRUB cannot be installed
+#
+# The ESP was mounted at /boot/efi the entire time. The deployer had already done the hard
+# part; the detection written to avoid depending on it was the single point of failure.
+#
+# So: trust the mount first, and use blkid -- verified present by provision.sh's build-time
+# tool check -- as the primary fallback, because lsblk's PARTTYPE column is the field that
+# demonstrably did not work. Five strategies, most authoritative first, and the log records
+# which one answered.
 #
 # THE LOG IS THE PRODUCT
 #
-# Because the deployer discards this script's output, the log is the only way to see
-# what happened. It is written to the DEPLOYED ROOT (not the ESP, 512 MiB and formatted
-# again by cmesh-byol-install) and survives the reboot, so it can be read from rescue
-# mode:
+# OVHcloud discards this script's output, so the log is the only diagnostic that exists. It
+# is written to the DEPLOYED ROOT (not the ESP, which cmesh-byol-install formats again) and
+# survives the reboot, so it can be read from rescue mode:
 #
-#   mount /dev/nvme0n1p2 /mnt && cat /mnt/var/log/ovh-make-bootable.log
+#   mount /dev/md3 /mnt && cat /mnt/var/log/ovh-make-bootable.log
 #
-# Read it FIRST when a deployment does not boot. It records the disk layout as the
-# deployer left it, the mount table, and the exit status of every step.
+# Read it FIRST when a deployment does not boot. Two rounds of this project were spent
+# guessing at a failure this log names outright.
 set -uo pipefail
 
 STATUS_LOG=""
@@ -226,11 +236,10 @@ EEXIT=0
 # not written here is lost.
 #
 # The log path is chosen by WRITING A TEST BYTE, not by trying the redirection and
-# checking its status: `exec > >(tee -a "$f")` always returns 0, whatever happens to
-# $f, because process substitution succeeds as soon as the pipe is created. Verifying
-# it that way selects a path that cannot be written and then loses every line to a tee
-# that dies asynchronously -- silently, which is the exact failure this log exists to
-# prevent.
+# checking its status: `exec > >(tee -a "$f")` always returns 0, whatever happens to $f,
+# because process substitution succeeds as soon as the pipe is created. Verifying it that
+# way selects a path that cannot be written and then loses every line to a tee that dies
+# asynchronously -- silently, which is the exact failure this log exists to prevent.
 log_path() {
     local dir
     for dir in "$@"; do
@@ -281,62 +290,110 @@ echo "cmesh-byol-bootloader: ===================================================
 
 ### State as the deployer left it ###
 
-# This is the record of what OVHcloud actually built. It is the first thing to look at
-# when the layout is not what the partitioning API was asked for.
+# The record of what OVHcloud actually built, and the raw material for every detection
+# below. It is the first thing to read when the layout is not what was asked for.
 echo "--- uname ---";            uname -a                          2>&1 | sed 's/^/  /'
 echo "--- firmware ---";         { [ -d /sys/firmware/efi ] && echo "UEFI" || echo "legacy BIOS"; } 2>&1 | sed 's/^/  /'
 echo "--- lsblk ---";            lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME,LABEL,MOUNTPOINT 2>&1 | sed 's/^/  /'
-echo "--- partitions ---";       cat /proc/partitions            2>&1 | sed 's/^/  /'
+echo "--- blkid (raw) ---";      blkid                             2>&1 | sed 's/^/  /'
+echo "--- mounts (vfat) ---";    grep -i vfat /proc/mounts        2>&1 | sed 's/^/  /'
 echo "--- mount table ---";      findmnt -rno TARGET,SOURCE,FSTYPE,OPTIONS 2>&1 | sed 's/^/  /'
-echo "--- /boot ---";            ls -la /boot                     2>&1 | sed 's/^/  /'
 echo "--- /boot/efi ---";        ls -la /boot/efi                 2>&1 | sed 's/^/  /'
 echo "--- /etc/fstab ---";       cat /etc/fstab                   2>&1 | sed 's/^/  /'
 
-### Locate the EFI System Partition(s) ###
+### Locate the EFI System Partition ###
 
-# /boot/efi has been populated on every deploy so far, but it is not documented that the
-# deployer creates that mount point, and this script must not depend on an undocumented
-# detail for the one step it cannot skip. Find the ESP by partition type GUID instead --
-# that is what the firmware looks for -- and mount it if it is not already mounted.
-ESP_DEVS=()
-esp_candidates() {
-    lsblk -rpnlo NAME,PARTTYPE 2>/dev/null | while read -r dev pt; do
-        # C12A7328-F81F-11D2-BA4B-00A0C93EC93B is the EFI System Partition type GUID.
-        case "$pt" in
-            c12a7328-f81f-11d2-ba4b-00a0c93ec93b|C12A7328-F81F-11D2-BA4B-00A0C93EC93B)
-                echo "$dev" ;;
-        esac
-    done
+# An ESP is a FAT partition. Validate that rather than trusting the source it came from,
+# because three of the five strategies below are heuristics.
+#
+# The [ -b ] test is the one thing a test cannot fake: it needs a real block device, and
+# test/hook-test.sh has no way to create one (mknod is refused even inside a user
+# namespace here). CMESH_BYOL_TEST_NONBLOCK exists so the detection CHAIN -- which is the
+# code that actually broke -- stays testable. It is unset in production, so the shipped
+# behaviour is the [ -b ] check, unchanged.
+is_esp() {
+    local dev="$1" fs
+    [ -n "${CMESH_BYOL_TEST_NONBLOCK:-}" ] || [ -b "$dev" ] || return 1
+    fs="$(blkid -o value -s TYPE "$dev" 2>/dev/null)"
+    [ "$fs" = "vfat" ] || [ "$fs" = "fat" ] || [ "$fs" = "msdos" ]
 }
 
-while IFS= read -r dev; do
-    [ -n "$dev" ] || continue
-    case " ${ESP_DEVS[*]-} " in
-        *" $dev "*) continue ;;
-    esac
+# Accumulate without duplicates; empty output from a failed query adds nothing.
+ESP_DEVS=()
+add_esp() {
+    local dev="$1" existing
+    [ -n "$dev" ] || return 0
+    is_esp "$dev" || return 0
+    for existing in "${ESP_DEVS[@]:-}"; do
+        [ "$existing" = "$dev" ] && return 0
+    done
     ESP_DEVS+=("$dev")
-done < <(esp_candidates)
+    return 0
+}
 
-# Fall back to any FAT partition if no ESP type GUID was found. A bootloader written to
-# a FAT partition the firmware does not treat as an ESP will not boot, but the attempt
-# costs nothing and the log then says exactly what was found.
-if [ "${#ESP_DEVS[@]}" -eq 0 ]; then
-    warn "no partition has the EFI System Partition type GUID"
-    while IFS= read -r dev; do
-        [ -n "$dev" ] || continue
-        ESP_DEVS+=("$dev")
-    done < <(lsblk -rpnlo NAME,FSTYPE 2>/dev/null | awk '$2=="vfat"{print $1}')
-    [ "${#ESP_DEVS[@]}" -gt 0 ] && warn "falling back to FAT partitions: ${ESP_DEVS[*]}"
+ESP_SOURCE=""
+
+# 1. /boot/efi is already mounted. This is what actually happened on the target, and it is
+#    also exactly where grub-install writes, so it is both the most authoritative and the
+#    most convenient answer. Check it FIRST.
+if mountpoint -q /boot/efi 2>/dev/null; then
+    esp_dev="$(findmnt -rn -o SOURCE /boot/efi 2>/dev/null)"
+    esp_dev="$(readlink -f "${esp_dev:-}" 2>/dev/null || echo "${esp_dev:-}")"
+    if [ -n "$esp_dev" ] && is_esp "$esp_dev"; then
+        add_esp "$esp_dev"
+        [ "${#ESP_DEVS[@]}" -gt 0 ] && ESP_SOURCE="/boot/efi is mounted on $esp_dev"
+    fi
 fi
 
-if [ "${#ESP_DEVS[@]}" -eq 0 ]; then
-    warn "no ESP found at all; GRUB cannot be installed by this hook"
+# 2. Any OTHER vfat partition already mounted. The deployer may mount the ESP somewhere
+#    else; the mount table is still a statement of fact, unlike a column name.
+if [ -z "$ESP_SOURCE" ]; then
+    while read -r mdev _; do
+        mdev="$(readlink -f "$mdev" 2>/dev/null || echo "$mdev")"
+        add_esp "$mdev"
+    done < <(grep -i ' vfat ' /proc/mounts 2>/dev/null)
+    [ "${#ESP_DEVS[@]}" -gt 0 ] && ESP_SOURCE="vfat partitions in /proc/mounts"
 fi
 
-# First ESP is mounted at the canonical /boot/efi, which is where grub-install expects
-# it and where grub.cfg's search will look. The others are mounted only long enough to
-# receive a copy of the loader, so that the machine still boots if the firmware picks a
-# different disk.
+# 3. blkid, by filesystem type. blkid reads the partition table directly and is verified
+#    present by provision.sh, so it does not depend on lsblk column behaviour at all.
+while read -r bdev; do
+    add_esp "$(readlink -f "$bdev" 2>/dev/null || echo "$bdev")"
+done < <(blkid -o device -t TYPE=vfat 2>/dev/null)
+[ -z "$ESP_SOURCE" ] && [ "${#ESP_DEVS[@]}" -gt 0 ] && ESP_SOURCE="blkid -t TYPE=vfat"
+
+# 4. blkid by EFI System Partition type GUID. C12A7328-F81F-11D2-BA4B-00A0C93EC93B.
+while read -r gdev; do
+    add_esp "$(readlink -f "$gdev" 2>/dev/null || echo "$gdev")"
+done < <(blkid -o device -t PARTTYPE=c12a7328-f81f-11d2-ba4b-00a0c93ec93b 2>/dev/null)
+[ -z "$ESP_SOURCE" ] && [ "${#ESP_DEVS[@]}" -gt 0 ] && ESP_SOURCE="blkid -t PARTTYPE=<esp guid>"
+
+# 5. The ESP mount point on disk, whether or not it is currently mounted. Last resort,
+#    because fstab is config rather than state; the device is still validated by is_esp.
+if [ -z "$ESP_SOURCE" ]; then
+    while read -r fdev; do
+        fdev="$(readlink -f "$fdev" 2>/dev/null || echo "$fdev")"
+        # fstab may name the device by LABEL= or UUID=; resolve it through blkid.
+        case "$fdev" in
+            /dev/*) add_esp "$fdev" ;;
+        esac
+    done < <(awk '$2=="/boot/efi" && $1 ~ /^\/dev\// {print $1}' /etc/fstab 2>/dev/null)
+    while read -r ldev; do
+        add_esp "$(readlink -f "$ldev" 2>/dev/null || echo "$ldev")"
+    done < <(blkid -o device -t LABEL=EFI_SYSPART 2>/dev/null)
+    [ "${#ESP_DEVS[@]}" -gt 0 ] && ESP_SOURCE="fstab / EFI_SYSPART label"
+fi
+
+if [ "${#ESP_DEVS[@]}" -gt 0 ]; then
+    log "ESP candidates (${ESP_SOURCE}): ${ESP_DEVS[*]}"
+else
+    warn "no EFI System Partition found by ANY of five methods"
+    warn "  tried: /boot/efi mountpoint, vfat in /proc/mounts, blkid TYPE=vfat,"
+    warn "         blkid PARTTYPE=<esp guid>, /etc/fstab + LABEL=EFI_SYSPART"
+    warn "  the raw blkid and mount output is logged above; GRUB cannot be installed"
+fi
+
+# Make sure the first candidate is mounted where grub-install expects to find it.
 mount_esp() {
     local dev="$1" target="$2"
     mkdir -p "$target" 2>/dev/null || return 1
@@ -354,7 +411,7 @@ PRIMARY_ESP=""
 if [ "${#ESP_DEVS[@]}" -gt 0 ]; then
     if mount_esp "${ESP_DEVS[0]}" /boot/efi; then
         PRIMARY_ESP="${ESP_DEVS[0]}"
-        log "ESP ${ESP_DEVS[0]} mounted at /boot/efi"
+        log "ESP ${ESP_DEVS[0]} is at /boot/efi"
     else
         warn "could not mount ${ESP_DEVS[0]} at /boot/efi"
     fi
@@ -439,19 +496,19 @@ if [ -f /etc/mkinitcpio.conf ]; then
 
     img=/boot/initramfs-linux.img
     if [ -f "$img" ]; then
-        # Verify by DECOMPRESSING: the image is a compressed cpio archive, so grepping
-        # the file directly finds nothing and would warn every time -- a check that
-        # always fires is worse than no check.
+        # Verify by DECOMPRESSING. The image is a compressed cpio archive, so grepping the
+        # file directly finds nothing. This is a WARNING, never a failure: the module files
+        # are named nvme.ko.zst and raid1.ko.zst, so a plain substring match is a weak test,
+        # and cmesh-byol-install rebuilds this initramfs on the target regardless.
         if command -v zstd >/dev/null 2>&1; then
-            missing=""
             for mod in nvme raid1; do
-                zstd -dc "$img" 2>/dev/null | grep -aq "$mod" || missing="$missing $mod"
+                if zstd -dc "$img" 2>/dev/null | grep -aq "$mod"; then
+                    log "  $mod present in the initramfs"
+                else
+                    warn "  $mod not DETECTED in the initramfs (weak substring test;"
+                    warn "  cmesh-byol-install rebuilds it on the target anyway)"
+                fi
             done
-            if [ -n "$missing" ]; then
-                warn "$img does not contain:${missing} (cmesh-byol-install rebuilds it anyway)"
-            else
-                log "verified nvme and raid1 are present in $(basename "$img")"
-            fi
         fi
         log "initramfs: $(basename "$img") $(stat -c %s "$img" 2>/dev/null) bytes"
     else
@@ -466,21 +523,16 @@ fi
 echo "--- ESP contents ---"
 find /boot/efi -maxdepth 3 2>/dev/null | sed 's/^/  /'
 
-LOADER_OK=0
 if [ -f /boot/efi/EFI/BOOT/BOOTX64.EFI ]; then
-    LOADER_OK=1
-else
-    EEXIT=1
-fi
-
-if [ "$LOADER_OK" -eq 1 ]; then
     report "bootloader installed; the encrypted install runs on first boot"
 else
-    # Exit non-zero only here, where the machine genuinely has no boot path. OVHcloud
-    # will report "the script did not end properly", which is accurate: there is
-    # nothing on the ESP for the firmware to fall back to.
-    report "FAILED: no /boot/efi/EFI/BOOT/BOOTX64.EFI. This machine has no boot path."
-    echo "cmesh-byol-bootloader: the ESP was found but the loader was not written to it."
+    # Exit non-zero only here, where the machine genuinely has no boot path. OVHcloud will
+    # report "the script did not end properly", which is accurate: there is nothing on the
+    # ESP for the firmware to fall back to.
+    EEXIT=1
+    report "FAILED: /boot/efi/EFI/BOOT/BOOTX64.EFI is missing. No boot path."
+    echo "cmesh-byol-bootloader: ESP candidates found: ${ESP_DEVS[*]:-none}"
+    echo "cmesh-byol-bootloader: detection method: ${ESP_SOURCE:-none}"
     echo "cmesh-byol-bootloader: see $LOG"
 fi
 
