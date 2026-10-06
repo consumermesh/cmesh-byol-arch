@@ -35,7 +35,7 @@ expose. It is rejected here deliberately — see [Why not ZFS](#why-not-zfs).
 ```
 nvme0n1                              nvme1n1
 ├─p1  512M  vfat  (ESP)              ├─p1  512M  vfat  (ESP)
-├─p2    2G  linux-raid ─┐            ├─p2    2G  linux-raid ─┐
+├─p2    1G  linux-raid ─┐            ├─p2    1G  linux-raid ─┐
 │                      ├─ md2 (raid1, ext4) → /boot         │
 └─p3  ~893G LUKS2 ─┐   │            └─p3  ~893G LUKS2 ─┐    │
    └─ cryptroot0 ──┴───┴──── md3 (raid1, ext4) ────────┴────┘
@@ -60,17 +60,18 @@ FAT32 directly — encrypting either means a passphrase at the bootloader plus a
 of an unbootable host. Neither holds PHI; the kernel and initramfs are not the sensitive
 part.
 
-`/boot` is **2 GiB**. Measured on an equivalent OVH Arch host, `/boot` actually holds
+`/boot` is **1 GiB**. Measured on an equivalent OVH Arch host, `/boot` actually holds
 **71 MiB** — `intel-ucode.img` 15M, `initramfs-linux.img` 20M, `vmlinuz-linux` 17M,
 `grub/` 19M, `amd-ucode.img` 0.3M — with one kernel installed and the stock mkinitcpio
-preset using `PRESETS=('default')`, so **no fallback image is built**. That is ~8% of a
-1 GiB partition, or ~12% transiently while a kernel upgrade has both versions on disk.
+preset using `PRESETS=('default')`, so **no fallback image is built**. That is ~8% of
+this partition, or ~12% transiently while a kernel upgrade has both versions on disk.
+OVH provision the same target at 988 MiB, so this is marginally more than the layout it
+replaces.
 
-So 1 GiB would very likely be fine, and this is **headroom rather than a fix**. It is
-worth taking because `/boot` has no LVM to grow into — enlarging it later means resizing
-a partition and an md array on a live encrypted system — and because it leaves room to
-add `linux-lts` as a second, independently bootable kernel. The extra GiB costs nothing
-against ~890 GiB.
+If you later add `linux-lts` as a second, independently bootable kernel, re-check it:
+two kernels roughly double the 37 MiB per-kernel cost, which still fits here, but it is
+the change that would eventually matter. `/boot` has no LVM to grow into, so resizing it
+later means working on a live encrypted partition and md array.
 
 The root filesystem is created with `-m 1` — 1% reserved blocks instead of ext4's 5%
 default. Unlike the `/boot` figure, this one is **measured on the real host**: `df`

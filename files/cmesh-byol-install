@@ -26,17 +26,17 @@ readonly ROOTFS_TAR="$WORKDIR/rootfs.tar.zst"
 readonly MNT=/mnt/cmesh-target
 readonly LOG=/var/log/cmesh-byol-install.log
 readonly MIN_MEM_MIB=8192
-# 2 GiB, where 1 GiB would very likely be enough. Measured on an equivalent OVH Arch
-# host: /boot holds 71 MiB total (intel-ucode 15M, initramfs 20M, vmlinuz 17M, grub 19M,
-# amd-ucode 0.3M), one kernel, and the mkinitcpio preset ships PRESETS=('default') so no
-# fallback image is built. That is ~8% of a 1 GiB partition, ~12% transiently during a
-# kernel upgrade.
+# 1 GiB. Measured on an equivalent OVH Arch host, /boot holds 71 MiB in total
+# (intel-ucode 15M, initramfs 20M, vmlinuz 17M, grub 19M, amd-ucode 0.3M) with one
+# kernel installed and the stock mkinitcpio preset using PRESETS=('default'), so no
+# fallback image is built. That is ~8% of this partition, ~12% transiently while a
+# kernel upgrade has both versions on disk — comfortably enough. OVH provision the same
+# target at 988 MiB, so this is slightly more than the layout it replaces.
 #
-# So this is headroom, not a fix. It is worth taking anyway because /boot has no LVM to
-# grow into: enlarging it later means resizing a partition and an md array on a live
-# encrypted system. The extra GiB costs nothing against ~890 GiB and buys the option of
-# adding linux-lts as a second, independently bootable kernel later.
-readonly BOOT_MIB=2048
+# If you later add linux-lts as a second independently bootable kernel, re-check this:
+# two kernels plus their images roughly doubles the 37 MiB per-kernel cost, which is
+# still fine here, but it is the change that would eventually matter.
+readonly BOOT_MIB=1024
 readonly ESP_MIB=512
 readonly LUKS_KEY=/boot/cmesh-luks.key
 readonly POOL_NAME=md3
