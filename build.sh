@@ -22,10 +22,19 @@
 set -euo pipefail
 
 # --- re-exec under the kvm group if necessary and possible -------------------------
-if [ -e /dev/kvm ] && ! id -Gn | tr ' ' '\n' | grep -qx kvm; then
-    if sg kvm -c true 2>/dev/null; then
+#
+# Depend on `sg` successfully ENTERING the group, rather than on predicting whether it
+# can. A gate that guesses and a probe that tests can disagree — and when they did, the
+# build silently ran without KVM while the probe said KVM was available. `sg` prints the
+# resulting group list, so confirm the group before trusting the re-entry.
+in_group() { id -Gn | tr ' ' '\n' | grep -qx kvm; }
+
+if [ -e /dev/kvm ] && ! in_group && command -v sg >/dev/null 2>&1; then
+    echo ">>> not in the kvm group; re-executing via sg kvm"
+    if sg kvm -c 'id -Gn | tr " " "\n" | grep -qx kvm'; then
         exec sg kvm -c "$(printf '%q ' "$0" "${@:-}")"
     fi
+    echo ">>> sg kvm did not grant the group — continuing without it" >&2
 fi
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -36,13 +45,17 @@ for t in packer qemu-system-x86_64 genisoimage sha512sum; do need "$t"; done
 # --- decide the accelerator by actually starting QEMU ------------------------------
 accel=tcg
 if [ -e /dev/kvm ]; then
+    # `|| true`: a non-zero exit here is the SUCCESS case (timeout kills qemu), and
+    # would otherwise trip set -e.
     probe_out="$(timeout 8 qemu-system-x86_64 -accel kvm -machine pc -m 128 \
         -display none -monitor none -serial none -no-reboot 2>&1 || true)"
     if grep -qiE 'permission denied|failed to (initialize|open) kvm|could not access kvm' \
         <<<"$probe_out"; then
         echo ">>> KVM present but not usable: ${probe_out:-no output}" >&2
+        echo ">>> active groups: $(id -Gn)" >&2
     else
         accel=kvm
+        echo ">>> KVM probe: qemu started under -accel kvm (killed by timeout, as expected)"
     fi
 else
     echo ">>> /dev/kvm absent" >&2
