@@ -39,42 +39,20 @@ jobs:
           packer version
           qemu-system-x86_64 --version | head -1
 
-      # /dev/kvm existing is NOT sufficient: GitHub's hosted runners create the node
-      # but deny the runner user access to it, so QEMU fails with
+      # KVM on GitHub's hosted runners: /dev/kvm ships as crw-rw---- root:kvm and the
+      # `runner` user is NOT in the kvm group, so QEMU dies with
       #   "Could not access KVM kernel module: Permission denied"
-      # after the build has already started. Test that KVM can actually be used, and
-      # fall back to tcg (software emulation) — slower, but it works.
+      # The capability is there; only the group membership is missing, and `sg kvm`
+      # applies it without a new login session. build.sh handles all of this (including
+      # the re-exec), so the detection lives in exactly one place.
       #
-      # NOTE: on GitHub-hosted runners this is expected to select tcg, and a full build
-      # under tcg can exceed the job timeout. The fast, reliable path is to build on the
-      # target server itself (or any machine with real KVM) — see the README.
-      - name: Choose accelerator
-        id: accel
-        run: |
-          accel=tcg
-          if [ ! -e /dev/kvm ]; then
-            echo "::warning::/dev/kvm absent — building under tcg (slow)"
-          elif ! dd if=/dev/kvm of=/dev/null bs=1 count=1 status=none 2>/dev/null; then
-            # The node exists but the runner user cannot open it. This is the
-            # GitHub-hosted-runner case, and it is why `test -e` is not enough.
-            echo "::warning::/dev/kvm present but not openable — building under tcg (slow)"
-          elif ! qemu-system-x86_64 -accel help 2>/dev/null | grep -qw kvm; then
-            echo "::warning::this qemu has no kvm accelerator — building under tcg"
-          else
-            accel=kvm
-            echo "KVM usable — building with hardware acceleration"
-          fi
-          echo "accelerator=$accel" >> "$GITHUB_OUTPUT"
-
-      # Run from the repository root: the HCL's provisioner paths are resolved
-      # relative to the working directory, and `packer init` needs the HCL path.
+      # There is deliberately no accelerator precheck step here: a check that can
+      # disagree with what the build actually does is worse than no check. build.sh
+      # probes by starting QEMU, reports the result, and builds with it.
       - name: Build image
         env:
           PACKER_LOG: "1"
-        run: |
-          packer init build_archlinux/archlinux.pkr.hcl
-          packer build -var accelerator=${{ steps.accel.outputs.accelerator }} \
-            build_archlinux/archlinux.pkr.hcl
+        run: ./build.sh
 
       - name: Checksum the image
         working-directory: build_archlinux
