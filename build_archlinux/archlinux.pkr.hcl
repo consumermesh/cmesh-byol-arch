@@ -50,10 +50,7 @@ source "qemu" "baremetal" {
   disk_discard = "unmap"
 
   accelerator = var.accelerator
-  # Pin a CPU model: under tcg the default model varies by host and can present a
-  # CPU that the cloud image's microcode packages or systemd dislike.
-  cpu_type = "max"
-  cpus     = 2
+  cpus        = 2
   memory      = 2048
   headless    = true
 

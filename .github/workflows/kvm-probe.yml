@@ -1,11 +1,15 @@
-name: KVM probe
+name: KVM mechanism probe
 
-# Throwaway diagnostic: is the KVM denial on hosted runners a group-permission problem
-# (fixable with `usermod -aG kvm`) or a genuine absence of nested virtualisation?
+# Throwaway diagnostic #2. The first probe established that KVM works on hosted
+# runners once the kvm GROUP is applied. This one establishes HOW to apply it
+# reliably, because build.sh's `sg kvm -c true` gate evidently failed while
+# `sg kvm -c '<qemu ...>'` had worked:
 #
-# If a trivial QEMU boot succeeds with KVM on, the real Builder workflow can use kvm
-# instead of falling back to tcg — which is the difference between a ~15 minute build
-# and one that risks the job timeout.
+#   * does `sg kvm -c true` return 0?
+#   * does `id -Gn` inside `sg kvm -c` show kvm?
+#   * does qemu actually start under -accel kvm through the mechanism?
+#
+# Delete once answered.
 
 on:
   workflow_dispatch:
@@ -13,43 +17,36 @@ on:
 jobs:
   probe:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
-      - name: Inspect /dev/kvm and user/group
-        run: |
-          echo "whoami: $(whoami)  uid=$(id -u)"
-          echo "groups: $(id -gn) / $(id -Gn)"
-          ls -l /dev/kvm || echo "/dev/kvm absent"
-          echo "--- can we open it now? ---"
-          if dd if=/dev/kvm of=/dev/null bs=1 count=1 status=none 2>/dev/null; then
-            echo "OPENABLE before any change"
-          else
-            echo "NOT openable before change"
-          fi
-
       - name: Install qemu
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86
 
-      - name: Try adding the runner user to the kvm group
+      - name: Inspect the sg mechanism
         run: |
-          sudo usermod -aG kvm "$(whoami)"
-          # A new login session is needed for the group to take effect; `sg` runs a
-          # command with the group without one.
-          if sg kvm -c 'dd if=/dev/kvm of=/dev/null bs=1 count=1 status=none' 2>/dev/null; then
-            echo "OPENABLE via sg kvm — the denial is a group-membership problem"
-          else
-            echo "STILL not openable via sg kvm"
-          fi
+          set -x
+          whoami
+          id -Gn
+          # runner is not in kvm yet; add it (has no effect on this session)
+          sudo usermod -aG kvm "$(whoami)" || true
 
-      - name: Try an actual KVM-accelerated QEMU boot
-        run: |
-          # KVM works or it does not; a 5s attempt to start a machine settles it.
-          if sg kvm -c 'timeout 8 qemu-system-x86_64 -accel kvm -machine pc -m 128 \
-               -display none -monitor none -serial none -no-reboot' 2>&1 | tee /tmp/kvm.log; then
-            echo "KVM boot attempt exited 0 (timeout kill is also acceptable)"
-          else
-            echo "KVM boot attempt failed:"
-            cat /tmp/kvm.log
-          fi
+          echo "--- sg kvm -c true ---"
+          sg kvm -c true; echo "exit=$?"
+
+          echo "--- groups inside sg kvm ---"
+          sg kvm -c 'id -Gn'; echo "exit=$?"
+
+          echo "--- qemu under sg kvm ---"
+          sg kvm -c 'timeout 8 qemu-system-x86_64 -accel kvm -machine pc -m 128 \
+            -display none -monitor none -serial none -no-reboot' 2>&1 | tail -3
+          echo "qemu_exit=$?"
+
+          echo "--- qemu under sudo -g kvm (alternative mechanism) ---"
+          sudo -g kvm -- sh -c 'timeout 8 qemu-system-x86_64 -accel kvm -machine pc \
+            -m 128 -display none -monitor none -serial none -no-reboot' 2>&1 | tail -3
+          echo "sudo_g_exit=$?"
+
+          echo "--- does a fresh login session pick up the group via newgrp? ---"
+          newgrp kvm </dev/null >/dev/null 2>&1; echo "newgrp_exit=$?"
