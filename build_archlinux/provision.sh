@@ -154,41 +154,67 @@ install -Dm644 "$FILES_SRC/cmesh-byol-finalize.service" \
 ln -sf /etc/systemd/system/cmesh-byol-install.service \
     /etc/systemd/system/multi-user.target.wants/cmesh-byol-install.service
 
-### Phase 4b: OVH's required hook file ###
+### Phase 4b: OVH's deploy-time hook — and the bootloader ###
 
-# /root/.ovh/make_image_bootable.sh MUST EXIST, or the deployment aborts before it
-# starts with:
+# /root/.ovh/make_image_bootable.sh is REQUIRED BY CONTRACT. OVH aborts the deployment
+# before it starts without it:
 #   The '/root/.ovh/make_image_bootable.sh' file does not exist.
 #
-# This is a hard requirement of the BYOL contract, independent of whether the hook is
-# useful. OVH's own build_archlinux ships one; this image deliberately omitted it on the
-# reasoning that the hook runs chrooted into the filesystem OVH already laid down, which
-# is too late to change the partition layout. That reasoning was right and the conclusion
-# was wrong: OVH *validates presence*, so the file has to be there even when it has
-# nothing to do.
+# But it is not merely a checkbox, and treating it as one is what broke the first real
+# deployment. OVHcloud runs this hook AFTER it has partitioned the disks, rsynced the
+# image into them and FORMATTED THE ESP. The consequence, confirmed from rescue mode:
 #
-# It is intentionally a no-op. Everything this image needs at deploy time happens on
-# first boot, from cmesh-byol-install, which repartitions both disks and installs into
-# the encrypted stack. Doing anything here would be doing it in the wrong place — and
-# OVH runs this before the first reboot, while the disk layout it just created is still
-# the one we are about to replace.
+#   /dev/nvme0n1p1 (511M vfat) mounted -> completely EMPTY. No /EFI/cmesh, no
+#   /EFI/BOOT, no /EFI at all.
+#
+# So nothing our image does at build time survives on the ESP, and the hook is the
+# intended place to install a bootloader. It is also the ONLY place: the machine cannot
+# boot far enough to run cmesh-byol-install until a loader exists, so the first-boot
+# installer can never install the thing needed to reach the first boot. A no-op stub here
+# is an unbootable server, which is exactly what the first deployment produced (rEFInd
+# reported "Chain on hard drive failed" and fell through to iPXE).
+#
+# The hook therefore installs GRUB and nothing else. It deliberately does NOT touch the
+# partition layout: this runs before the first reboot, while the layout OVH just created
+# is still the one cmesh-byol-install is going to replace.
 install -d -m 0755 /root/.ovh
 cat > /root/.ovh/make_image_bootable.sh <<'HOOK'
 #!/bin/bash
-# Required by the OVHcloud BYOL contract. Deliberately does nothing.
+# Installs a UEFI bootloader so the machine can reach its first boot, where
+# /usr/local/sbin/cmesh-byol-install rewrites both disks as LUKS2 under RAID1.
 #
-# This image does not configure the deployed system here. It cannot: this hook runs
-# chrooted into the filesystem OVH has already partitioned and formatted, which is after
-# the point where the disk layout could still be changed. The real work happens on the
-# FIRST BOOT of the deployed system, in /usr/local/sbin/cmesh-byol-install, which
-# rewrites both disks as LUKS2 under RAID1 and installs into them.
-#
-# See https://github.com/consumermesh/cmesh-byol-arch
+# Runs chrooted by the OVHcloud deployer after the image has been written. The ESP is
+# empty at this point, whatever the build image contained, so this is where GRUB has to
+# go. See https://github.com/consumermesh/cmesh-byol-arch
 set -euo pipefail
 
-echo "cmesh-byol-arch: nothing to do here by design."
-echo "  The encrypted install runs on first boot: /usr/local/sbin/cmesh-byol-install"
-echo "  Progress is logged to /var/log/cmesh-byol-install.log and /dev/console."
+log() { echo "cmesh-byol-bootloader: $*"; }
+
+log "installing GRUB to the EFI System Partition"
+
+# --removable is required, not cosmetic. OVHcloud servers network-boot and the firmware
+# boot order must not be touched, so no NVRAM entry is created (--no-nvram). With no
+# NVRAM entry, firmware falls back to the REMOVABLE MEDIA PATH, \EFI\BOOT\BOOTX64.EFI.
+# Without --removable that file does not exist and the machine does not boot at all.
+grub-install --target=x86_64-efi \
+    --efi-directory=/boot/efi \
+    --bootloader-id=cmesh \
+    --removable --no-nvram --recheck
+
+log "regenerating grub.cfg"
+grub-mkconfig -o /boot/grub/grub.cfg
+
+# Fail loudly rather than hand back an unbootable machine. Both of these were missing on
+# the first deployment and neither produced an error -- the failure only surfaced as
+# "Chain on hard drive failed" on the console, after a full upload and deploy.
+[ -f /boot/efi/EFI/BOOT/BOOTX64.EFI ] \
+    || { echo "FATAL: /boot/efi/EFI/BOOT/BOOTX64.EFI was not created; this server will not boot" >&2; exit 1; }
+[ -f /boot/grub/grub.cfg ] \
+    || { echo "FATAL: /boot/grub/grub.cfg was not created; GRUB would drop to a rescue prompt" >&2; exit 1; }
+
+log "ESP contents:"
+find /boot/efi -maxdepth 3 2>/dev/null | sed 's/^/  /'
+log "bootloader installed; the encrypted install runs on first boot"
 HOOK
 
 chmod 0755 /root/.ovh/make_image_bootable.sh

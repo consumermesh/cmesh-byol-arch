@@ -266,6 +266,36 @@ The passphrase is read from the config drive, used to create both keyslots, and 
 config drive is then **overwritten with random bytes** so the only copy on the server is
 inside the LUKS keyslots.
 
+## Two phases: the deploy-time hook, then the first boot
+
+There are two places code runs, and confusing them produces an unbootable server — which
+is what happened on the first real deployment.
+
+**Phase 1 — `/root/.ovh/make_image_bootable.sh`, run by OVHcloud during deployment.**
+OVHcloud partitions the disks, rsyncs the image in, and **formats the ESP**. Confirmed
+from rescue mode on a failed deployment: the ESP came out completely empty, with no
+`/EFI` directory at all. So nothing the build image puts on the ESP survives, and this
+hook is the only place a bootloader can be installed.
+
+It installs GRUB with `--removable`, which writes `\EFI\BOOT\BOOTX64.EFI` — the UEFI
+fallback path. That is required rather than cosmetic: we pass `--no-nvram` because OVH
+servers network-boot and the firmware boot order must not be touched, and with no NVRAM
+entry the firmware only ever finds the removable path. It also regenerates `grub.cfg`,
+and fails loudly if either file is missing.
+
+The hook deliberately does **not** touch the partition layout. It runs before the first
+reboot, while the layout OVH just created is still the one the installer is about to
+replace.
+
+**Phase 2 — `cmesh-byol-install`, on the first boot of the deployed system.**
+Only reachable once Phase 1 has produced a loader. It reads the LUKS passphrase, stages
+the rootfs in tmpfs, destroys both partition tables, builds LUKS2-under-RAID1, installs
+into it, and reboots.
+
+> The ordering is the subtle part. Phase 2 cannot install the bootloader that Phase 2
+> needs in order to run. A no-op Phase 1 therefore does not produce a degraded system —
+> it produces a server that never boots.
+
 ## What happens on first boot
 
 Roughly two minutes after the deployer finishes:

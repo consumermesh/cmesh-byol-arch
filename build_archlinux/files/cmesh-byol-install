@@ -375,10 +375,23 @@ install_grub() {
         mount --make-rslave "$MNT/$fs"
     done
 
-    # root= is resolved by sd-encrypt from crypttab, then md3 assembles and mounts. No
-    # hard-coded device name in the cmdline.
+    # --removable writes the loader to the UEFI REMOVABLE MEDIA PATH,
+    # \EFI\BOOT\BOOTX64.EFI, which is the location firmware falls back to when no
+    # NVRAM boot entry points anywhere. That fallback is not optional here:
+    # --no-nvram means we deliberately create no NVRAM entry (OVHcloud servers
+    # network-boot and we must not touch the firmware boot order), so without the
+    # removable path there is nothing for the firmware to find.
+    #
+    # This is exactly how the first deployment failed: the ESP held \EFI\cmesh\
+    # grubx64.efi, no \EFI\BOOT\ at all, and no NVRAM entry. OVH's rEFInd reported
+    # "Chain on hard drive failed", fell through to iPXE, and the machine never
+    # booted -- so cmesh-byol-install never ran and the disks were left as a plain
+    # ext4 RAID1 with no LUKS.
+    #
+    # --removable implies --no-nvram, which is kept explicitly for the reader.
     chroot "$MNT" grub-install --target=x86_64-efi \
-        --efi-directory=/boot/efi --bootloader-id=cmesh --no-nvram --recheck
+        --efi-directory=/boot/efi --bootloader-id=cmesh \
+        --removable --no-nvram --recheck
 
     chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
 
@@ -396,14 +409,51 @@ install_grub() {
         mount --rbind "/$fs" "$MNT/$fs"
         mount --make-rslave "$MNT/$fs"
     done
+    # Same --removable treatment, so the second disk is ALSO bootable without an NVRAM
+    # entry. A fallback loader on only one ESP would make the mirror pointless for boot.
     chroot "$MNT" grub-install --target=x86_64-efi \
-        --efi-directory=/boot/efi --bootloader-id=cmesh2 --no-nvram --recheck
+        --efi-directory=/boot/efi --bootloader-id=cmesh2 \
+        --removable --no-nvram --recheck
     for fs in dev proc sys; do
         umount -R "$MNT/$fs" 2>/dev/null || true
     done
     umount "$MNT/boot/efi"
 
-    log "GRUB installed on both ESPs"
+    # Assert the two things the firmware needs, on BOTH ESPs, before declaring success.
+    #
+    # The first deployment failed precisely here and said nothing: grub-install exited 0,
+    # the installer reported "GRUB installed on both ESPs", the machine then could not
+    # boot at all, and the cause was only findable by mounting the ESP from rescue mode
+    # and noticing a missing directory. A failed boot is the most expensive possible way
+    # to discover a missing file, and both of these are one ls away.
+    local d esp verr=0
+    local -a esps=("${DISKS[0]}p1" "${DISKS[1]}p1")
+    for d in "${esps[@]}"; do
+        esp="$(mktemp -d)"
+        if ! mount -o ro "$d" "$esp" 2>/dev/null; then
+            warn "could not mount ${d} to verify its ESP contents"
+            verr=1
+            continue
+        fi
+        # \EFI\BOOT\BOOTX64.EFI is what firmware boots when no NVRAM entry exists, which
+        # is our situation by design (--no-nvram).
+        [ -f "$esp/EFI/BOOT/BOOTX64.EFI" ] \
+            || { warn "${d}: /EFI/BOOT/BOOTX64.EFI is MISSING — this disk will not boot without an NVRAM entry"; verr=1; }
+        ls "$esp"/EFI/cmesh*/grubx64.efi >/dev/null 2>&1 \
+            || { warn "${d}: no /EFI/cmesh*/grubx64.efi found"; verr=1; }
+        umount "$esp"
+        rmdir "$esp"
+    done
+
+    # grub.cfg lives on /boot, not the ESP, and GRUB cannot start without it.
+    [ -f "$MNT/boot/grub/grub.cfg" ] \
+        || { warn "/boot/grub/grub.cfg is MISSING — GRUB would drop to a rescue prompt"; verr=1; }
+
+    if [ "$verr" -ne 0 ]; then
+        die "GRUB verification failed; refusing to report a bootable system. Fix before rebooting."
+    fi
+
+    log "GRUB installed and verified on both ESPs (removable path + grub.cfg present)"
 }
 
 scrub_config_drive() {
