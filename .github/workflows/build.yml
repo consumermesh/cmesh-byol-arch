@@ -54,13 +54,16 @@ jobs:
           PACKER_LOG: "1"
         run: ./build.sh
 
+      # The artifact is at <repo>/output, NOT build_archlinux/output: output_directory is
+      # resolved against the working directory, and packer runs from the repository root.
+      # No working-directory override here, and the paths below must stay consistent with
+      # the upload and publish steps or a tag build succeeds and then fails to upload.
       - name: Checksum the image
-        working-directory: build_archlinux
         run: |
           test -f output/archlinux.qcow2
           # sha512 to match OVH's imageCheckSumType: "sha512".
           sha512sum output/archlinux.qcow2 | awk '{print $1}' > output/archlinux.qcow2.sha512
-          # A bare digest, so the value can be pasted straight into imageCheckSum.
+          # With the filename, for humans and for verification.
           sha512sum output/archlinux.qcow2 > output/archlinux.qcow2.sha512.txt
           echo "--- image ---"
           ls -lh output/archlinux.qcow2
@@ -72,9 +75,9 @@ jobs:
         with:
           name: archlinux-qcow2
           path: |
-            build_archlinux/output/archlinux.qcow2
-            build_archlinux/output/archlinux.qcow2.sha512
-            build_archlinux/output/archlinux.qcow2.sha512.txt
+            output/archlinux.qcow2
+            output/archlinux.qcow2.sha512
+            output/archlinux.qcow2.sha512.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -89,10 +92,10 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --title "$TAG" --generate-notes
           gh release upload "$TAG" \
-            build_archlinux/output/archlinux.qcow2 \
-            build_archlinux/output/archlinux.qcow2.sha512 \
-            build_archlinux/output/archlinux.qcow2.sha512.txt \
+            output/archlinux.qcow2 \
+            output/archlinux.qcow2.sha512 \
+            output/archlinux.qcow2.sha512.txt \
             --clobber
           echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
           echo "imageURL:      https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/archlinux.qcow2" >> "$GITHUB_STEP_SUMMARY"
-          echo "imageCheckSum: $(cat build_archlinux/output/archlinux.qcow2.sha512)" >> "$GITHUB_STEP_SUMMARY"
+          echo "imageCheckSum: $(cat output/archlinux.qcow2.sha512)" >> "$GITHUB_STEP_SUMMARY"
