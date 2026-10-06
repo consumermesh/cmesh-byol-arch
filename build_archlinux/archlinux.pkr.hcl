@@ -107,12 +107,17 @@ build {
     # this HCL file — so `build_archlinux/files` must be spelled out when packer is
     # invoked from the repository root (which is what the CI workflow does).
     #
-    # destination is the PARENT directory: packer appends the source's basename, so
-    # this yields /tmp/cmesh-byol-files/<file>. Pointing it at /tmp/cmesh-byol-files
-    # instead produced /tmp/cmesh-byol-files/cmesh-byol-files/<file>, and provision.sh
-    # then failed with "cannot stat ...: Not a directory".
+    # destination is a DIRECTORY INTO WHICH the files are placed: packer appends the
+    # source basename and creates it, so with source "build_archlinux/files/" the four
+    # files land at /tmp/cmesh-byol-files/<name>.
+    #
+    # Do NOT "fix" this to /tmp on the theory that the basename is appended the other
+    # way round. Doing that drops the files loose in /tmp and provision.sh then fails
+    # with "FATAL: /tmp/cmesh-byol-files is not a directory". The authoritative evidence
+    # is the shell provisioner: packer writes its own script to /tmp/script_<pid>.sh,
+    # i.e. it appends the basename to the destination directory.
     source      = "build_archlinux/files/"
-    destination = "/tmp"
+    destination = "/tmp/cmesh-byol-files"
   }
 
   provisioner "shell" {
