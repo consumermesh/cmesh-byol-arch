@@ -60,17 +60,27 @@ FAT32 directly — encrypting either means a passphrase at the bootloader plus a
 of an unbootable host. Neither holds PHI; the kernel and initramfs are not the sensitive
 part.
 
-`/boot` is **2 GiB**, not the more usual 1 GiB. Two initramfs images (default *and*
-fallback) carrying the full `mdadm_udev` + `sd-encrypt` stack, plus two kernels, will not
-survive repeated kernel updates inside 1 GiB. The failure is delayed and unpleasant: a
-full `/boot` breaks the *next* kernel update, and growing `/boot` afterwards means
-resizing a partition and an md array on a live encrypted system. 2 GiB costs nothing
-against 894 GiB.
+`/boot` is **2 GiB**. Measured on an equivalent OVH Arch host, `/boot` actually holds
+**71 MiB** — `intel-ucode.img` 15M, `initramfs-linux.img` 20M, `vmlinuz-linux` 17M,
+`grub/` 19M, `amd-ucode.img` 0.3M — with one kernel installed and the stock mkinitcpio
+preset using `PRESETS=('default')`, so **no fallback image is built**. That is ~8% of a
+1 GiB partition, or ~12% transiently while a kernel upgrade has both versions on disk.
+
+So 1 GiB would very likely be fine, and this is **headroom rather than a fix**. It is
+worth taking because `/boot` has no LVM to grow into — enlarging it later means resizing
+a partition and an md array on a live encrypted system — and because it leaves room to
+add `linux-lts` as a second, independently bootable kernel. The extra GiB costs nothing
+against ~890 GiB.
 
 The root filesystem is created with `-m 1` — 1% reserved blocks instead of ext4's 5%
-default. On a ~890 GiB data volume the default withholds ~44 GiB from every non-root
-user, including postgres, for no benefit; 1% (~9 GiB) keeps the fragmentation headroom
-the reservation exists for.
+default. Unlike the `/boot` figure, this one is **measured on the real host**: `df`
+reports `878G total, 3.0G used, 830G avail`, and `878 − 3 − 830 = 45 GiB` of hidden
+reserve, i.e. 5.15%. Dropping to 1% returns **~35 GiB** to non-root users, including
+postgres.
+
+Note also that `df` on that host reports 878 GiB for a partition of ~891 GiB: the
+difference is ext4's own inode and bitmap overhead (~1.5%), not free space. Plan capacity
+against the `df` number, not the partition size.
 
 ## Swap, and why it is a file
 

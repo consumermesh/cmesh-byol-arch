@@ -26,11 +26,16 @@ readonly ROOTFS_TAR="$WORKDIR/rootfs.tar.zst"
 readonly MNT=/mnt/cmesh-target
 readonly LOG=/var/log/cmesh-byol-install.log
 readonly MIN_MEM_MIB=8192
-# 2 GiB, not 1. Two initramfs images (default + fallback) carrying the full mdadm_udev +
-# sd-encrypt stack, plus two kernels, will not survive repeated kernel updates in 1 GiB.
-# A full /boot fails the NEXT kernel update, months later, at a point where GRUB drops
-# you to a rescue prompt — and resizing /boot afterwards means growing a partition and
-# an md array on a live encrypted system. 2 GiB costs nothing against 894 GiB.
+# 2 GiB, where 1 GiB would very likely be enough. Measured on an equivalent OVH Arch
+# host: /boot holds 71 MiB total (intel-ucode 15M, initramfs 20M, vmlinuz 17M, grub 19M,
+# amd-ucode 0.3M), one kernel, and the mkinitcpio preset ships PRESETS=('default') so no
+# fallback image is built. That is ~8% of a 1 GiB partition, ~12% transiently during a
+# kernel upgrade.
+#
+# So this is headroom, not a fix. It is worth taking anyway because /boot has no LVM to
+# grow into: enlarging it later means resizing a partition and an md array on a live
+# encrypted system. The extra GiB costs nothing against ~890 GiB and buys the option of
+# adding linux-lts as a second, independently bootable kernel later.
 readonly BOOT_MIB=2048
 readonly ESP_MIB=512
 readonly LUKS_KEY=/boot/cmesh-luks.key
