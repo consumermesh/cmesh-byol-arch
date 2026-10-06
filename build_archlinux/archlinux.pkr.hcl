@@ -15,7 +15,7 @@ packer {
 #   1. No /root/.ovh/make_image_bootable.sh. That hook runs chrooted inside the
 #      filesystem OVH already laid down, which is too late to change the partition
 #      layout or the RAID stacking. Everything interesting happens on first boot
-#      instead, from files/cmesh-byol-install.
+#      instead, from build_archlinux/files/cmesh-byol-install.
 #   2. The image still satisfies the BYOL contract exactly (single ext4 partition),
 #      because OVH requires that of the image it burns.
 
@@ -74,12 +74,15 @@ build {
   sources = ["source.qemu.baremetal"]
 
   provisioner "file" {
-    source      = "files/"
+    # Paths in a provisioner are resolved relative to the WORKING DIRECTORY, not to
+    # this HCL file — so `build_archlinux/files` must be spelled out when packer is
+    # invoked from the repository root (which is what the CI workflow does).
+    source      = "build_archlinux/files/"
     destination = "/tmp/cmesh-byol-files"
   }
 
   provisioner "shell" {
     execute_command = "chmod +x {{ .Path }} && sudo {{ .Path }}"
-    script          = "provision.sh"
+    script          = "build_archlinux/provision.sh"
   }
 }

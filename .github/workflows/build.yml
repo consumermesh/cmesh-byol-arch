@@ -47,13 +47,14 @@ jobs:
           packer version
           qemu-system-x86_64 --version | head -1
 
+      # Run from the repository root: the HCL's provisioner paths are resolved
+      # relative to the working directory, and `packer init` needs the HCL path.
       - name: Build image
-        working-directory: build_archlinux
         env:
           PACKER_LOG: "1"
         run: |
-          packer init archlinux.pkr.hcl
-          packer build archlinux.pkr.hcl
+          packer init build_archlinux/archlinux.pkr.hcl
+          packer build build_archlinux/archlinux.pkr.hcl
 
       - name: Checksum the image
         working-directory: build_archlinux

@@ -163,12 +163,16 @@ https://github.com/consumermesh/cmesh-byol-arch/releases/download/<tag>/archlinu
 
 ### 2. Or build locally
 
+Run from the **repository root** — the HCL's provisioner paths are resolved relative to
+the working directory, not to the HCL file:
+
 ```bash
 packer init build_archlinux/archlinux.pkr.hcl
-cd build_archlinux && PACKER_LOG=1 packer build archlinux.pkr.hcl
+PACKER_LOG=1 packer build build_archlinux/archlinux.pkr.hcl
 ```
 
-Requires `packer`, `qemu-system-x86`, `qemu-utils` and `genisoimage`.
+Requires `packer`, `qemu-system-x86`, `qemu-utils` and `genisoimage`, plus `/dev/kvm`.
+The image lands in `build_archlinux/output/`.
 
 ### 3. Deploy it
 
@@ -257,7 +261,7 @@ boot instead.
 
 Auto-unlock is enrolled **without a PIN** (`--tpm2-with-pin` omitted) so the server can
 recover from a power event without a human. Add `--tpm2-with-pin=yes` to the
-`systemd-cryptenroll` call in `files/cmesh-byol-finalize` if you would rather have a
+`systemd-cryptenroll` call in `build_archlinux/files/cmesh-byol-finalize` if you would rather have a
 second factor and accept console access on every boot. Record whichever you choose —
 and record the PCR policy, because a firmware update that changes those measurements
 turns silent unlock into a passphrase prompt.
