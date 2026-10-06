@@ -107,6 +107,22 @@ done
 
 ### Phase 4: Install the first-boot installer ###
 
+# The packer `file` provisioner appends the source basename to its destination, so the
+# files arrive as /tmp/cmesh-byol-files/<name>. Verify that explicitly — the previous
+# misconfigured destination produced
+#   install: cannot stat '/tmp/cmesh-byol-files/cmesh-byol-install': Not a directory
+# which reads like a missing file but was actually a doubled directory component.
+if [ ! -d /tmp/cmesh-byol-files ]; then
+    echo "FATAL: /tmp/cmesh-byol-files is not a directory — check the file provisioner destination" >&2
+    ls -la /tmp | head -20 >&2
+    exit 1
+fi
+
+for f in cmesh-byol-install cmesh-byol-finalize cmesh-byol-install.service cmesh-byol-finalize.service; do
+    [ -f "/tmp/cmesh-byol-files/$f" ] \
+        || { echo "FATAL: packer did not deliver /tmp/cmesh-byol-files/$f" >&2; ls -la /tmp/cmesh-byol-files >&2; exit 1; }
+done
+
 install -Dm755 /tmp/cmesh-byol-files/cmesh-byol-install /usr/local/sbin/cmesh-byol-install
 install -Dm755 /tmp/cmesh-byol-files/cmesh-byol-finalize /usr/local/sbin/cmesh-byol-finalize
 

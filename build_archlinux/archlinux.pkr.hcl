@@ -90,8 +90,13 @@ build {
     # Paths in a provisioner are resolved relative to the WORKING DIRECTORY, not to
     # this HCL file — so `build_archlinux/files` must be spelled out when packer is
     # invoked from the repository root (which is what the CI workflow does).
+    #
+    # destination is the PARENT directory: packer appends the source's basename, so
+    # this yields /tmp/cmesh-byol-files/<file>. Pointing it at /tmp/cmesh-byol-files
+    # instead produced /tmp/cmesh-byol-files/cmesh-byol-files/<file>, and provision.sh
+    # then failed with "cannot stat ...: Not a directory".
     source      = "build_archlinux/files/"
-    destination = "/tmp/cmesh-byol-files"
+    destination = "/tmp"
   }
 
   provisioner "shell" {

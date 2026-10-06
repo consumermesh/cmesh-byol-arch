@@ -1,13 +1,11 @@
-name: KVM mechanism probe
+name: sg gate probe
 
-# Throwaway diagnostic #2. The first probe established that KVM works on hosted
-# runners once the kvm GROUP is applied. This one establishes HOW to apply it
-# reliably, because build.sh's `sg kvm -c true` gate evidently failed while
-# `sg kvm -c '<qemu ...>'` had worked:
+# Throwaway diagnostic #3. build.sh enters its re-exec branch and then fails the
+# verification that `sg kvm` actually granted the group, while probe #2 showed
+# `sg kvm -c 'id -Gn'` returning "kvm adm users docker systemd-journal runner".
 #
-#   * does `sg kvm -c true` return 0?
-#   * does `id -Gn` inside `sg kvm -c` show kvm?
-#   * does qemu actually start under -accel kvm through the mechanism?
+# So one of the two must be untrue. This runs the EXACT expressions from build.sh and
+# prints every intermediate result, so the disagreement is visible instead of inferred.
 #
 # Delete once answered.
 
@@ -24,29 +22,37 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86
 
-      - name: Inspect the sg mechanism
+      - name: Exact build.sh expressions
         run: |
           set -x
-          whoami
-          id -Gn
-          # runner is not in kvm yet; add it (has no effect on this session)
-          sudo usermod -aG kvm "$(whoami)" || true
+          echo "A) outer id -Gn: $(id -Gn)"
 
-          echo "--- sg kvm -c true ---"
-          sg kvm -c true; echo "exit=$?"
+          in_group() { id -Gn | tr ' ' '\n' | grep -qx kvm; }
+          if in_group; then echo "B) in_group: yes"; else echo "B) in_group: no"; fi
 
-          echo "--- groups inside sg kvm ---"
-          sg kvm -c 'id -Gn'; echo "exit=$?"
+          echo "C) command -v sg: $(command -v sg || echo MISSING)"
 
-          echo "--- qemu under sg kvm ---"
-          sg kvm -c 'timeout 8 qemu-system-x86_64 -accel kvm -machine pc -m 128 \
-            -display none -monitor none -serial none -no-reboot' 2>&1 | tail -3
-          echo "qemu_exit=$?"
+          echo "D) does the group kvm exist at all? $(getent group kvm || echo NO-SUCH-GROUP)"
 
-          echo "--- qemu under sudo -g kvm (alternative mechanism) ---"
-          sudo -g kvm -- sh -c 'timeout 8 qemu-system-x86_64 -accel kvm -machine pc \
-            -m 128 -display none -monitor none -serial none -no-reboot' 2>&1 | tail -3
-          echo "sudo_g_exit=$?"
+          echo "E) sg kvm -c 'id -Gn' raw:"
+          sg kvm -c 'id -Gn'; echo "E_exit=$?"
 
-          echo "--- does a fresh login session pick up the group via newgrp? ---"
-          newgrp kvm </dev/null >/dev/null 2>&1; echo "newgrp_exit=$?"
+          echo "F) the EXACT verification build.sh uses:"
+          if sg kvm -c 'id -Gn | tr " " "\n" | grep -qx kvm'; then
+            echo "F) VERIFIED — group present inside sg"
+          else
+            echo "F) FAILED — group NOT seen inside sg (exit $?)"
+          fi
+
+          echo "G) same test, inner grep exit status broken out:"
+          sg kvm -c 'id -Gn | tr " " "\n" | grep -qx kvm'; echo "G_exit=$?"
+
+          echo "H) is /dev/kvm openable inside sg (qemu test, the only valid one):"
+          sg kvm -c 'timeout 6 qemu-system-x86_64 -accel kvm -machine pc -m 128 \
+            -display none -monitor none -serial none -no-reboot' 2>&1 | tail -2
+          echo "H_note=timeout kill is SUCCESS"
+
+          echo "I) sudo -g kvm variant, for comparison:"
+          sudo -g kvm sh -c 'timeout 6 qemu-system-x86_64 -accel kvm -machine pc -m 128 \
+            -display none -monitor none -serial none -no-reboot' 2>&1 | tail -2
+          echo "I_note=timeout kill is SUCCESS"
