@@ -35,7 +35,7 @@ expose. It is rejected here deliberately — see [Why not ZFS](#why-not-zfs).
 ```
 nvme0n1                              nvme1n1
 ├─p1  512M  vfat  (ESP)              ├─p1  512M  vfat  (ESP)
-├─p2    1G  linux-raid ─┐            ├─p2    1G  linux-raid ─┐
+├─p2    2G  linux-raid ─┐            ├─p2    2G  linux-raid ─┐
 │                      ├─ md2 (raid1, ext4) → /boot         │
 └─p3  ~893G LUKS2 ─┐   │            └─p3  ~893G LUKS2 ─┐    │
    └─ cryptroot0 ──┴───┴──── md3 (raid1, ext4) ────────┴────┘
@@ -59,6 +59,18 @@ you bought the second disk for. If you take one thing from this repo, take that.
 FAT32 directly — encrypting either means a passphrase at the bootloader plus a real risk
 of an unbootable host. Neither holds PHI; the kernel and initramfs are not the sensitive
 part.
+
+`/boot` is **2 GiB**, not the more usual 1 GiB. Two initramfs images (default *and*
+fallback) carrying the full `mdadm_udev` + `sd-encrypt` stack, plus two kernels, will not
+survive repeated kernel updates inside 1 GiB. The failure is delayed and unpleasant: a
+full `/boot` breaks the *next* kernel update, and growing `/boot` afterwards means
+resizing a partition and an md array on a live encrypted system. 2 GiB costs nothing
+against 894 GiB.
+
+The root filesystem is created with `-m 1` — 1% reserved blocks instead of ext4's 5%
+default. On a ~890 GiB data volume the default withholds ~44 GiB from every non-root
+user, including postgres, for no benefit; 1% (~9 GiB) keeps the fragmentation headroom
+the reservation exists for.
 
 ## Swap, and why it is a file
 

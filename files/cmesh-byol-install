@@ -26,7 +26,12 @@ readonly ROOTFS_TAR="$WORKDIR/rootfs.tar.zst"
 readonly MNT=/mnt/cmesh-target
 readonly LOG=/var/log/cmesh-byol-install.log
 readonly MIN_MEM_MIB=8192
-readonly BOOT_MIB=1024
+# 2 GiB, not 1. Two initramfs images (default + fallback) carrying the full mdadm_udev +
+# sd-encrypt stack, plus two kernels, will not survive repeated kernel updates in 1 GiB.
+# A full /boot fails the NEXT kernel update, months later, at a point where GRUB drops
+# you to a rescue prompt — and resizing /boot afterwards means growing a partition and
+# an md array on a live encrypted system. 2 GiB costs nothing against 894 GiB.
+readonly BOOT_MIB=2048
 readonly ESP_MIB=512
 readonly LUKS_KEY=/boot/cmesh-luks.key
 readonly POOL_NAME=md3
@@ -215,7 +220,12 @@ create_encrypted_root() {
     # The members are dm-crypt devices, NOT the raw partitions — this is the whole point.
     mdadm --create "/dev/${POOL_NAME}" --level=1 --raid-devices=2 --metadata=1.2 \
         --name=root --run /dev/mapper/cryptroot0 /dev/mapper/cryptroot1
-    mkfs.ext4 -q -L root "/dev/${POOL_NAME}"
+
+    # -m 1: ext4 reserves 5% of the volume for root by default. That default is tuned for
+    # a small root partition where a full disk would break the system; on a ~890 GiB data
+    # volume it silently withholds ~44 GiB from every non-root user, including postgres.
+    # 1% (~9 GiB) keeps the fragmentation headroom the reservation exists for.
+    mkfs.ext4 -q -L root -m 1 "/dev/${POOL_NAME}"
 }
 
 ### Install into the encrypted root #################################################
