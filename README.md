@@ -165,7 +165,25 @@ sudo pacman -S --needed packer qemu-system-x86 qemu-utils cdrtools   # or libiso
 
 Takes roughly 10–20 minutes with KVM, and prints the image path, size and sha512.
 
-### 2. Or let CI publish a release
+### 2. Or build it in a container
+
+If you would rather not install packer and QEMU on the machine, run the build inside a
+throwaway Arch container. **Run this on the host**, not inside another container:
+
+```bash
+./build-in-container.sh
+RUNTIME=docker ./build-in-container.sh        # force a runtime
+CPUS=8 MEMORY=8g ./build-in-container.sh
+```
+
+The repository is bind-mounted read-only and copied inside the container, so your
+working tree cannot be modified by a failed build. `build_archlinux/output/` is
+bind-mounted so the `.qcow2` lands on the host, and the checksum is printed.
+
+`/dev/kvm` is passed through when present — that is the whole reason to prefer this over
+CI. Without it the build falls back to software emulation, which works but is slower.
+
+### 3. Or let CI publish a release
 
 Push a tag and the [`Builder`](.github/workflows/build.yml) workflow attaches
 `archlinux.qcow2` and its checksum to a GitHub Release. Release asset URLs are directly
@@ -176,14 +194,13 @@ https://github.com/consumermesh/cmesh-byol-arch/releases/download/<tag>/archlinu
 https://github.com/consumermesh/cmesh-byol-arch/releases/download/<tag>/archlinux.qcow2.sha512
 ```
 
-> **CI caveat.** GitHub's hosted runners expose `/dev/kvm` but deny access to it, so the
-> workflow falls back to `tcg` (software emulation). A full build under `tcg` is slow
-> enough to risk the job timeout. To get CI building properly, use a runner with real
-> KVM (self-hosted, or a larger runner), or build on the target server as above. The
-> workflow probes KVM before choosing, so it will use hardware acceleration
-> automatically wherever it is actually available.
+> **CI caveat.** GitHub's hosted runners expose `/dev/kvm` but the `runner` user is not
+> in the `kvm` group, and `build.sh`'s `sg kvm` fallback does not reliably obtain it
+> there. The workflow therefore builds under `tcg`. Measured: a booted,
+> SSH-reachable guest in **~4 minutes** and the full build well inside the job timeout,
+> so this is viable but not fast. Prefer method 1 or 2 when you want speed.
 
-### 3. Or build manually
+### 4. Or build manually
 
 Run from the **repository root** — the HCL's provisioner paths are resolved relative to
 the working directory, not to the HCL file:
@@ -197,7 +214,7 @@ packer build -var accelerator=tcg build_archlinux/archlinux.pkr.hcl   # force so
 Requires `packer`, `qemu-system-x86`, `qemu-utils` and `genisoimage`, plus `/dev/kvm`
 for a tolerable build time. The image lands in `build_archlinux/output/`.
 
-### 4. Deploy it
+### 5. Deploy it
 
 Via the OVHcloud Control Panel: **Bare Metal Cloud → Dedicated servers → your server →
 General information → `...` → Install → Custom → Bring Your Own Linux**, then supply the
