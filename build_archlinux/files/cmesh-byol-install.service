@@ -1,11 +1,32 @@
 [Unit]
 Description=cmesh BYOL first-boot encrypted install (LUKS2 under RAID1)
 Documentation=https://github.com/consumermesh/cmesh-byol-arch
-# DefaultDependencies=no so this runs early in boot, before anything has a reason to
-# hold the disks. It reboots the machine itself when it succeeds.
-DefaultDependencies=no
-After=sysinit.target local-fs.target
-Before=network-pre.target
+# ORDERING: deliberately minimal, and do not add to it casually.
+#
+# This unit previously carried `DefaultDependencies=no`, `After=sysinit.target
+# local-fs.target` AND `Before=network-pre.target` while also being `WantedBy=
+# multi-user.target`. That is a DEPENDENCY CYCLE: network-pre.target is ordered before
+# multi-user.target, so the unit was required to run before a target that runs before
+# the unit itself. Systemd resolves such a cycle by dropping the job -- so on the first
+# real deployment the installer never started at all: no output, no error, nothing on
+# the console. That is exactly the reported symptom ("taking too long, nothing
+# happening").
+#
+# multi-user.target is already ordered after sysinit.target and local-fs.target, which
+# is everything this needs, and the script tees its own output to /dev/console so serial
+# visibility does not depend on systemd.
+#
+# After=cloud-init.target is a real requirement, not politeness: cloud-init is what
+# mounts the config drive, and the config drive is where the LUKS passphrase comes from.
+# Running before it completes produces
+#   FATAL: no cmesh_luks_passphrase found on the config drive
+# on a machine that has done nothing wrong. A nonexistent ordering target is silently
+# ignored by systemd, so this is safe if cloud-init is ever absent (Arch's cloud-init
+# package provides cloud-init.target as a static target).
+#
+# If you ever need this to run earlier, remove it from multi-user.target.wants and wire
+# it explicitly -- but do NOT re-add Before=network-pre.target.
+After=local-fs.target cloud-init.target
 # Never let a failed install be "restarted" into a loop that re-wipes disks. The script
 # exits 0 when the completion marker exists; a genuine failure stops here and is read
 # over the serial console, which the script tees to.
