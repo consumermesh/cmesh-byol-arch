@@ -150,18 +150,40 @@ out-of-tree module, kernel updates unconstrained.
 
 ## How to use it
 
-### 1. Build the image (CI, preferred)
+### 1. Build it (recommended: on the target server)
 
-Push a tag; the [`Builder`](.github/workflows/build.yml) workflow produces a GitHub
-Release containing `archlinux.qcow2` and its `.sha512`, exactly like OVH's own example
-images. Release asset URLs are directly consumable by the OVHcloud API:
+The image is only needed to install a server, so the shortest path is to build it **on
+that server**. KVM is available there, nothing needs uploading, and the checksum is
+printed for the `imageCheckSum` field:
+
+```bash
+git clone https://github.com/consumermesh/cmesh-byol-arch
+cd cmesh-byol-arch
+sudo pacman -S --needed packer qemu-system-x86 qemu-utils cdrtools   # or libisoburn
+./build.sh
+```
+
+Takes roughly 10–20 minutes with KVM, and prints the image path, size and sha512.
+
+### 2. Or let CI publish a release
+
+Push a tag and the [`Builder`](.github/workflows/build.yml) workflow attaches
+`archlinux.qcow2` and its checksum to a GitHub Release. Release asset URLs are directly
+consumable by the OVHcloud API:
 
 ```
 https://github.com/consumermesh/cmesh-byol-arch/releases/download/<tag>/archlinux.qcow2
 https://github.com/consumermesh/cmesh-byol-arch/releases/download/<tag>/archlinux.qcow2.sha512
 ```
 
-### 2. Or build locally
+> **CI caveat.** GitHub's hosted runners expose `/dev/kvm` but deny access to it, so the
+> workflow falls back to `tcg` (software emulation). A full build under `tcg` is slow
+> enough to risk the job timeout. To get CI building properly, use a runner with real
+> KVM (self-hosted, or a larger runner), or build on the target server as above. The
+> workflow probes KVM before choosing, so it will use hardware acceleration
+> automatically wherever it is actually available.
+
+### 3. Or build manually
 
 Run from the **repository root** — the HCL's provisioner paths are resolved relative to
 the working directory, not to the HCL file:
@@ -169,12 +191,13 @@ the working directory, not to the HCL file:
 ```bash
 packer init build_archlinux/archlinux.pkr.hcl
 PACKER_LOG=1 packer build build_archlinux/archlinux.pkr.hcl
+packer build -var accelerator=tcg build_archlinux/archlinux.pkr.hcl   # force software
 ```
 
-Requires `packer`, `qemu-system-x86`, `qemu-utils` and `genisoimage`, plus `/dev/kvm`.
-The image lands in `build_archlinux/output/`.
+Requires `packer`, `qemu-system-x86`, `qemu-utils` and `genisoimage`, plus `/dev/kvm`
+for a tolerable build time. The image lands in `build_archlinux/output/`.
 
-### 3. Deploy it
+### 4. Deploy it
 
 Via the OVHcloud Control Panel: **Bare Metal Cloud → Dedicated servers → your server →
 General information → `...` → Install → Custom → Bring Your Own Linux**, then supply the

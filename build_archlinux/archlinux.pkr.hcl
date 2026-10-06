@@ -7,6 +7,19 @@ packer {
   }
 }
 
+# Hardware acceleration for the build VM.
+#
+# "kvm" is 10-30x faster and is what you want on a machine that offers it (bare metal,
+# or a runner with real nested virtualisation). "tcg" is pure software emulation: slow,
+# but it works anywhere — including CI runners that expose /dev/kvm but deny access to
+# it, which is the case for GitHub's hosted runners.
+#
+# Override at build time:  packer build -var accelerator=tcg ...
+variable "accelerator" {
+  type    = string
+  default = "kvm"
+}
+
 # Builds a BYOL-compatible Arch Linux image whose FIRST BOOT on the target bare-metal
 # server re-partitions both disks into LUKS2-under-RAID1 and installs the system into it.
 #
@@ -36,8 +49,11 @@ source "qemu" "baremetal" {
   # Let blkdiscard in provision.sh actually release freed blocks in the qcow2.
   disk_discard = "unmap"
 
-  accelerator = "kvm"
-  cpus        = 2
+  accelerator = var.accelerator
+  # Pin a CPU model: under tcg the default model varies by host and can present a
+  # CPU that the cloud image's microcode packages or systemd dislike.
+  cpu_type = "max"
+  cpus     = 2
   memory      = 2048
   headless    = true
 
