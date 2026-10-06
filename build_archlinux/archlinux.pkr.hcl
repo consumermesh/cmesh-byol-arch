@@ -68,6 +68,13 @@ source "qemu" "baremetal" {
   qemuargs = [["-serial", "stdio"]]
 
   # cloud-init NoCloud seed: create the provisioning user from the CD.
+  #
+  # `shell: /bin/bash` is explicit rather than relying on the image's default account
+  # shell — OVH's Ubuntu example (known-good on the same runners) specifies it and their
+  # Arch example does not. The sshd drop-in is likewise belt-and-braces for
+  # PasswordAuthentication, which `ssh_pwauth` alone sets by editing the main
+  # sshd_config. Neither is currently required — the build connects without them — so
+  # they are deliberately minimal and permissive-free.
   cd_content = {
     "meta-data" = ""
     "user-data" = <<-USERDATA
@@ -78,6 +85,15 @@ source "qemu" "baremetal" {
         plain_text_passwd: packer
         sudo: ALL=(ALL) NOPASSWD:ALL
         lock_passwd: false
+        shell: /bin/bash
+    write_files:
+      - path: /etc/ssh/sshd_config.d/99-packer.conf
+        permissions: '0644'
+        content: |
+          PasswordAuthentication yes
+          UseDNS no
+    runcmd:
+      - systemctl restart sshd || systemctl restart ssh || true
     USERDATA
   }
   cd_label = "cidata"
