@@ -116,11 +116,25 @@ check_tools() {
 read_passphrase() {
     # Supplied via cloud-init configDriveUserData, e.g.:
     #   cmesh_luks_passphrase: "correct horse battery staple"
+    #   ssh_authorized_keys:
+    #     - ssh-ed25519 AAAA... you@host
     #
     # The config drive is a small vfat partition labelled 'cidata' or 'config-2'. It is
     # read here — before anything is destroyed — and scrubbed later.
+    #
+    # The SSH keys are read in the same pass, from the same file, and for the same
+    # reason: this is the last moment the config drive exists. Relying on cloud-init to
+    # have delivered them to the rootfs already would make login depend on cloud-init's
+    # stage ordering relative to this unit, which is not something to hang remote access
+    # on. Reading them here is deterministic.
     local cd_mnt=/run/cmesh-configdrive dev
     mkdir -p "$cd_mnt"
+
+    # Both are assigned inside the loop below, which may never reach an assignment if no
+    # config-drive partition mounts. Under `set -u` that would abort on first use, so
+    # initialise them here.
+    LUKS_PASSPHRASE=""
+    CMESH_SSH_KEYS=""
 
     for dev in $(blkid -o device -t LABEL=cidata 2>/dev/null; blkid -o device -t LABEL=config-2 2>/dev/null); do
         if mount -o ro "$dev" "$cd_mnt" 2>/dev/null; then
@@ -129,19 +143,50 @@ read_passphrase() {
                 # example line above the real one.
                 LUKS_PASSPHRASE=$(grep -E '^[[:space:]]*cmesh_luks_passphrase:' "$cd_mnt/user-data" \
                     | tail -1 | sed -E 's/^[^:]*:[[:space:]]*//; s/^["'"'"']//; s/["'"'"']$//')
+
+                # ssh_authorized_keys is a YAML list, so the keys are the indented "- "
+                # lines that FOLLOW the key. Collecting every such line would also match
+                # other list keys in the cloud-config, so this tracks the section and
+                # stops at the first line that dedents back out of it.
+                # CMESH-SSH-KEY-PARSER-BEGIN (test/ssh-key-test.sh extracts this block)
+                CMESH_SSH_KEYS=$(awk '
+                    /^[[:space:]]*ssh_authorized_keys:/ { inseck=1; next }
+                    inseck {
+                        if ($0 ~ /^[[:space:]]*-[[:space:]]/) {
+                            line = $0
+                            sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+                            sub(/[[:space:]]+$/, "", line)
+                            gsub(/^["'"'"']|["'"'"']$/, "", line)
+                            if (length(line) > 0) print line
+                            next
+                        }
+                        inseck = 0
+                    }
+                ' "$cd_mnt/user-data")
+                # CMESH-SSH-KEY-PARSER-END
             fi
             umount "$cd_mnt"
             [ -n "${LUKS_PASSPHRASE:-}" ] && break
         fi
     done
 
-    [ -n "${LUKS_PASSPHRASE:-}" ] || die \
+    [ -n "$LUKS_PASSPHRASE" ] || die \
         "no cmesh_luks_passphrase found on the config drive. Set it in configDriveUserData (base64-encoded cloud-config)."
 
     [ "${#LUKS_PASSPHRASE}" -ge 12 ] || die \
         "cmesh_luks_passphrase is too short (${#LUKS_PASSPHRASE} chars); use at least 12"
 
     log "passphrase read from the config drive (${#LUKS_PASSPHRASE} chars)"
+
+    if [ -n "$CMESH_SSH_KEYS" ]; then
+        log "SSH keys read from the config drive: $(printf '%s\n' "$CMESH_SSH_KEYS" | grep -c . )"
+    else
+        warn "no ssh_authorized_keys in the config drive user-data."
+        warn "  The installed system will boot with sshd running but NO key, so the"
+        warn "  only way in is the OVHcloud KVM console. Add to configDriveUserData:"
+        warn "    ssh_authorized_keys:"
+        warn "      - ssh-ed25519 AAAA... you@host"
+    fi
 }
 
 ### Stage the rootfs ################################################################
@@ -469,6 +514,53 @@ scrub_config_drive() {
     warn "if any config-drive device survived, the passphrase may remain on it"
 }
 
+install_ssh_keys() {
+    # Write the keys read from the config drive, and enable sshd.
+    #
+    # WHY BOTH, AND WHY HERE
+    #
+    # The first install booted successfully and was then unreachable: the installer
+    # enabled systemd-networkd and systemd-resolved but never enabled sshd, and the
+    # image's sshd is not enabled by default. Everything below is the fix.
+    #
+    # The keys come from the config drive rather than from whatever cloud-init left in
+    # the rootfs, because this is deterministic: it does not depend on whether cloud-init
+    # ran before the config drive was scrubbed, or on which of its stages delivered the
+    # keys. The rootfs is staged from the running bootstrap system, so anything
+    # cloud-init did write does carry over — but "carries over" is not something to bet
+    # remote access on.
+    if [ -n "$CMESH_SSH_KEYS" ]; then
+        log "installing SSH keys for root"
+        install -d -m 0700 "$MNT/root/.ssh"
+        printf '%s\n' "$CMESH_SSH_KEYS" > "$MNT/root/.ssh/authorized_keys"
+        chmod 0600 "$MNT/root/.ssh/authorized_keys"
+        log "authorized_keys: $(grep -c . "$MNT/root/.ssh/authorized_keys") key(s)"
+    else
+        warn "no SSH keys to install; log in over the OVHcloud KVM console instead"
+    fi
+
+    # Enable whichever unit this image actually ships. Arch calls it sshd.service; the
+    # alias ssh.service exists on some builds. Test for the unit file rather than
+    # creating a symlink unconditionally, so a missing or renamed unit is reported here
+    # instead of showing up later as a broken symlink in multi-user.target.wants.
+    local unit
+    for unit in sshd.service ssh.service; do
+        if [ -f "$MNT/usr/lib/systemd/system/$unit" ] \
+            || [ -f "$MNT/etc/systemd/system/$unit" ]; then
+            chroot "$MNT" systemctl enable "$unit" 2>/dev/null \
+                || ln -sf "/usr/lib/systemd/system/$unit" \
+                    "$MNT/etc/systemd/system/multi-user.target.wants/$unit"
+            log "enabled $unit"
+            return 0
+        fi
+    done
+
+    # Not fatal: the install itself succeeded and the disk is correct, so failing here
+    # would leave a working encrypted system behind a non-zero exit. Say it loudly.
+    warn "sshd is NOT installed in this image — the machine will have no remote access."
+    warn "  reach it over the OVHcloud KVM console, then: pacman -S openssh && systemctl enable --now sshd"
+}
+
 ### Main ############################################################################
 
 main() {
@@ -529,6 +621,19 @@ EOF
 
     chroot "$MNT" systemd-machine-id-setup
     chroot "$MNT" systemctl enable systemd-networkd systemd-resolved 2>/dev/null || true
+
+    install_ssh_keys
+
+    # cloud-init served the BOOTSTRAP boot only: it is what made the config drive
+    # readable, and that drive has just been scrubbed. Leaving it enabled on the
+    # installed system means a service that waits for a datasource that is never coming
+    # — and cloud-init has network-configuration modules of its own, which would race
+    # systemd-networkd for the interface. Networking above is ours; cloud-init is done.
+    for unit in cloud-init.service cloud-init-local.service cloud-config.service \
+                cloud-final.service cloud-init.target; do
+        chroot "$MNT" systemctl disable "$unit" 2>/dev/null || true
+    done
+    log "disabled cloud-init on the installed system (networking is systemd-networkd)"
 
     sync
     umount -R "$MNT" 2>/dev/null || true

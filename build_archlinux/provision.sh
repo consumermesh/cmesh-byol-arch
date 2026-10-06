@@ -15,7 +15,11 @@ pacman -Syu --noconfirm
 # cryptsetup + mdadm are the whole point; systemd-cryptenroll ships with systemd and is
 # what enrols the TPM on first boot. dosfstools/gptfdisk for the ESP and partition
 # tables, rsync for the rootfs copy, zstd for the in-RAM tarball, e2fsprogs for
-# mkfs.ext4 and resize2fs.
+# mkfs.ext4 and resize2fs, openssh because the installed system is administered over SSH.
+#
+# The cloud image does ship openssh, but it is named here rather than inherited: the
+# first install booted into a system with no sshd enabled, and remote access should not
+# depend on a package arriving transitively from a base image that rolls.
 #
 # Deliberately NOT installed: zfs-utils/zfs-dkms. See README "Why not ZFS" — ZFS is not
 # in Arch's official repos, pins the kernel, and its initramfs hook is incompatible with
@@ -32,19 +36,30 @@ pacman -S --noconfirm --needed \
     parted \
     linux-firmware-intel \
     intel-ucode \
-    amd-ucode
+    amd-ucode \
+    openssh
 
 # Fail the build early if any tool the installer shells out to is missing, rather than
 # discovering it on a customer's server with the disks already wiped.
 for tool in cryptsetup mdadm sgdisk mkfs.ext4 mkfs.vfat rsync tar zstd \
             systemd-cryptenroll grub-install grub-mkconfig mkinitcpio blkid findmnt \
-            mkswap fallocate chattr; do
+            mkswap fallocate chattr sshd; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "FATAL: required tool '$tool' is missing from the image" >&2
         exit 1
     fi
 done
 echo ">>> all required tools present"
+
+# The installer enables sshd on the installed system, and a typo'd unit name would only
+# surface as "no remote access" on a machine that is otherwise finished.
+for unit in sshd.service; do
+    if [ ! -f "/usr/lib/systemd/system/$unit" ]; then
+        echo "FATAL: systemd unit '$unit' is missing; the installed system would have no SSH" >&2
+        exit 1
+    fi
+done
+echo ">>> sshd unit present"
 
 # The installer writes the TARGET's mkinitcpio.conf using the systemd, mdadm_udev and
 # sd-encrypt hooks. sd-encrypt is what understands crypttab in the initramfs and a TPM2
