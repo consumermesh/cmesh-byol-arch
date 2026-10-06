@@ -107,28 +107,46 @@ done
 
 ### Phase 4: Install the first-boot installer ###
 
-# The packer `file` provisioner appends the source basename to its destination, so the
-# files arrive as /tmp/cmesh-byol-files/<name>. Verify that explicitly — the previous
-# misconfigured destination produced
-#   install: cannot stat '/tmp/cmesh-byol-files/cmesh-byol-install': Not a directory
-# which reads like a missing file but was actually a doubled directory component.
-if [ ! -d /tmp/cmesh-byol-files ]; then
-    echo "FATAL: /tmp/cmesh-byol-files is not a directory — check the file provisioner destination" >&2
-    ls -la /tmp | head -20 >&2
-    exit 1
-fi
-
-for f in cmesh-byol-install cmesh-byol-finalize cmesh-byol-install.service cmesh-byol-finalize.service; do
-    [ -f "/tmp/cmesh-byol-files/$f" ] \
-        || { echo "FATAL: packer did not deliver /tmp/cmesh-byol-files/$f" >&2; ls -la /tmp/cmesh-byol-files >&2; exit 1; }
+# Locate the files the `file` provisioner delivered.
+#
+# This deliberately accepts EITHER layout rather than asserting one, because the
+# destination semantics have cost two build cycles already and guessing between them is
+# what caused it. Observed in practice:
+#
+#   destination = "/tmp"                 -> files loose in /tmp        (v6 log)
+#   destination = "/tmp/cmesh-byol-files" -> "Not a directory" on install (v5 log)
+#
+# The shell provisioner's own script appears as /tmp/script_<pid>.sh, so packer does
+# append a basename to the destination directory; why the second form failed is not
+# established. Rather than keep theorising, find them and say which was found.
+FILES_SRC=""
+for candidate in /tmp/cmesh-byol-files /tmp; do
+    if [ -f "$candidate/cmesh-byol-install" ] && [ -f "$candidate/cmesh-byol-finalize" ]; then
+        FILES_SRC="$candidate"
+        break
+    fi
 done
 
-install -Dm755 /tmp/cmesh-byol-files/cmesh-byol-install /usr/local/sbin/cmesh-byol-install
-install -Dm755 /tmp/cmesh-byol-files/cmesh-byol-finalize /usr/local/sbin/cmesh-byol-finalize
+if [ -z "$FILES_SRC" ]; then
+    echo "FATAL: could not find the delivered installer files in /tmp/cmesh-byol-files or /tmp" >&2
+    echo "--- /tmp ---" >&2
+    ls -la /tmp >&2
+    [ -d /tmp/cmesh-byol-files ] && { echo "--- /tmp/cmesh-byol-files ---" >&2; ls -la /tmp/cmesh-byol-files >&2; }
+    exit 1
+fi
+echo ">>> installer files found in ${FILES_SRC}"
 
-install -Dm644 /tmp/cmesh-byol-files/cmesh-byol-install.service \
+for f in cmesh-byol-install cmesh-byol-finalize cmesh-byol-install.service cmesh-byol-finalize.service; do
+    [ -f "$FILES_SRC/$f" ] \
+        || { echo "FATAL: ${FILES_SRC}/$f was not delivered" >&2; ls -la "$FILES_SRC" >&2; exit 1; }
+done
+
+install -Dm755 "$FILES_SRC/cmesh-byol-install" /usr/local/sbin/cmesh-byol-install
+install -Dm755 "$FILES_SRC/cmesh-byol-finalize" /usr/local/sbin/cmesh-byol-finalize
+
+install -Dm644 "$FILES_SRC/cmesh-byol-install.service" \
     /etc/systemd/system/cmesh-byol-install.service
-install -Dm644 /tmp/cmesh-byol-files/cmesh-byol-finalize.service \
+install -Dm644 "$FILES_SRC/cmesh-byol-finalize.service" \
     /etc/systemd/system/cmesh-byol-finalize.service
 
 # The installer runs on the first boot of the deployed system. It is NOT enabled here:
