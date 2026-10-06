@@ -174,21 +174,36 @@ ln -sf /etc/systemd/system/cmesh-byol-install.service \
 # is an unbootable server, which is exactly what the first deployment produced (rEFInd
 # reported "Chain on hard drive failed" and fell through to iPXE).
 #
-# The hook therefore installs GRUB and nothing else. It deliberately does NOT touch the
-# partition layout: this runs before the first reboot, while the layout OVH just created
-# is still the one cmesh-byol-install is going to replace.
+# The hook therefore installs GRUB AND regenerates the initramfs. It deliberately does
+# NOT touch the partition layout: this runs before the first reboot, while the layout OVH
+# just created is still the one cmesh-byol-install is going to replace.
 install -d -m 0755 /root/.ovh
 cat > /root/.ovh/make_image_bootable.sh <<'HOOK'
 #!/bin/bash
-# Installs a UEFI bootloader so the machine can reach its first boot, where
+# Makes the deployed system bootable, so it can reach its first boot where
 # /usr/local/sbin/cmesh-byol-install rewrites both disks as LUKS2 under RAID1.
 #
-# Runs chrooted by the OVHcloud deployer after the image has been written. The ESP is
-# empty at this point, whatever the build image contained, so this is where GRUB has to
-# go. See https://github.com/consumermesh/cmesh-byol-arch
+# Runs chrooted by the OVHcloud deployer after the image has been written. Two things
+# have to happen here, and both are because the image was built somewhere else:
+#
+#   1. GRUB must be installed. The ESP is empty at this point, whatever the build image
+#      contained -- OVHcloud formats it when it writes the image.
+#
+#   2. The INITRAMFS MUST BE REGENERATED. This is the part that was missing, and it cost
+#      a deployment: the image's initramfs was built inside a QEMU build VM, where
+#      `autodetect` embedded only the modules needed to boot VIRTIO disks. This server
+#      boots from NVMe behind an md RAID1 array, so the initramfs contained no nvme, no
+#      SATA and no md/raid1 modules. The kernel could not see /dev/md3, and the boot
+#      died in the initramfs -- before systemd, before any unit, leaving no journal and
+#      no log. The symptom was a machine that displayed "Loading Linux linux ..." and
+#      then did nothing.
+#
+# See https://github.com/consumermesh/cmesh-byol-arch
 set -euo pipefail
 
 log() { echo "cmesh-byol-bootloader: $*"; }
+
+### 1. GRUB ###
 
 log "installing GRUB to the EFI System Partition"
 
@@ -212,9 +227,62 @@ grub-mkconfig -o /boot/grub/grub.cfg
 [ -f /boot/grub/grub.cfg ] \
     || { echo "FATAL: /boot/grub/grub.cfg was not created; GRUB would drop to a rescue prompt" >&2; exit 1; }
 
+### 2. initramfs for THIS hardware ###
+
+log "rebuilding the initramfs for this machine"
+
+# Force the storage modules in rather than relying on autodetect to infer them.
+#
+# autodetect works from the RUNNING system's /sys, which is the right input -- but it
+# only needs to miss one module for the machine to hang with no output, and this is the
+# failure that already cost a deployment. Being explicit costs a few hundred KB.
+#
+#   nvme  - without it the kernel cannot see the NVMe disks at all
+#   raid1 - without it md3 never assembles, so root never appears
+#
+# (The same reasoning as OVH's own example, whose provision.sh sets MODULES and HOOKS
+# for bare metal before shipping.)
+if grep -q '^MODULES=()' /etc/mkinitcpio.conf; then
+    sed -i 's/^MODULES=()/MODULES=(nvme raid1)/' /etc/mkinitcpio.conf
+    log "  set MODULES=(nvme raid1)"
+elif grep -q '^MODULES=' /etc/mkinitcpio.conf; then
+    grep -q 'nvme' /etc/mkinitcpio.conf || sed -i 's/^MODULES=(/MODULES=(nvme raid1 /' /etc/mkinitcpio.conf
+fi
+grep '^MODULES=' /etc/mkinitcpio.conf | sed 's/^/  /'
+
+# -P rebuilds every kernel preset using this machine's drivers. That is the whole point:
+# the shipped initramfs was built in a QEMU VM and knew only about virtio.
+mkinitcpio -P
+
+img="$(ls -1 /boot/initramfs-linux.img 2>/dev/null | head -1)"
+[ -n "$img" ] || { echo "FATAL: no initramfs was produced by mkinitcpio" >&2; exit 1; }
+
+# Verify by DECOMPRESSING. The image is a compressed cpio archive, so grepping the file
+# directly finds nothing and would warn every time -- a check that always fires is worse
+# than no check. mkinitcpio writes zstd by default.
+if command -v zstd >/dev/null 2>&1; then
+    missing=""
+    for mod in nvme raid1; do
+        if ! zstd -dc "$img" 2>/dev/null | grep -aq "$mod"; then
+            missing="$missing $mod"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        echo "FATAL: $img does not contain:${missing}" >&2
+        echo "  This machine boots NVMe behind md RAID1. Without these the kernel cannot" >&2
+        echo "  find root, and the boot dies in the initramfs with no output at all." >&2
+        exit 1
+    fi
+    log "  verified nvme and raid1 are present in $(basename "$img")"
+else
+    echo "WARNING: zstd not available; cannot verify the initramfs contents" >&2
+fi
+
+log "initramfs: $(basename "$img") $(stat -c %s "$img") bytes, rebuilt $(date -Is)"
+
 log "ESP contents:"
 find /boot/efi -maxdepth 3 2>/dev/null | sed 's/^/  /'
-log "bootloader installed; the encrypted install runs on first boot"
+log "bootloader and initramfs ready; the encrypted install runs on first boot"
 HOOK
 
 chmod 0755 /root/.ovh/make_image_bootable.sh
