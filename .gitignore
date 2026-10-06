@@ -1,5 +1,10 @@
-# Packer build output
+# Packer build output.
+# The REAL location is <repo>/output — output_directory is resolved against the working
+# directory, and packer runs from the repository root — so both are listed.
+/output/
+output.prev.*
 build_archlinux/output/
+build_archlinux/output.prev.*
 *.qcow2
 *.qcow2.sha512
 *.qcow2.sha512.txt

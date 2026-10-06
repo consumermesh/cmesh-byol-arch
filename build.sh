@@ -77,8 +77,32 @@ if [ -n "${GITHUB_ENV:-}" ]; then echo "ACCELERATOR=${accel}" >> "$GITHUB_ENV"; 
 packer init build_archlinux/archlinux.pkr.hcl
 packer build -var "accelerator=${accel}" build_archlinux/archlinux.pkr.hcl
 
-img=build_archlinux/output/archlinux.qcow2
-[ -f "$img" ] || { echo "FATAL: ${img} was not produced" >&2; exit 1; }
+# --- locate the artifact ------------------------------------------------------------
+#
+# WHERE PACKER ACTUALLY WRITES: output_directory is resolved against the WORKING
+# DIRECTORY, not the HCL file. packer is invoked as `packer build
+# build_archlinux/archlinux.pkr.hcl` from the repository root, so `output_directory =
+# "output"` produces <repo>/output/, NOT <repo>/build_archlinux/output/.
+#
+# This was wrong in both build.sh and build-in-container.sh for several runs, each time
+# reporting "not produced" for an image that had in fact been built successfully. Search
+# for it instead of naming one path — that is the whole lesson of this file.
+img=""
+for candidate in output/archlinux.qcow2 build_archlinux/output/archlinux.qcow2; do
+    if [ -f "$candidate" ]; then img="$candidate"; break; fi
+done
+if [ -z "$img" ]; then
+    img="$(find . -maxdepth 3 -name '*.qcow2' -type f \
+           -not -path './build_archlinux/output.prev.*' -not -path '*/packer_cache/*' \
+           2>/dev/null | head -1)"
+fi
+if [ -z "$img" ] || [ ! -f "$img" ]; then
+    echo "FATAL: no .qcow2 found; packer did not produce an artifact" >&2
+    echo "--- what is on disk ---" >&2
+    find . -maxdepth 3 -name '*.qcow2' 2>/dev/null | head >&2
+    ls -la output build_archlinux/output 2>/dev/null >&2
+    exit 1
+fi
 
 sum=$(sha512sum "$img" | awk '{print $1}')
 echo
