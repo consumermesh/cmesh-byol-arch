@@ -40,6 +40,9 @@ readonly BOOT_MIB=1024
 readonly ESP_MIB=512
 readonly LUKS_KEY=/boot/cmesh-luks.key
 readonly POOL_NAME=md3
+# How long to wait for the config-drive partition to be enumerated before giving up and
+# reporting. Not a dependency on anything -- see wait_for_config_drive().
+readonly CONFIG_DRIVE_TIMEOUT_SEC=60
 
 # Duplicated to the serial console so a failed install is readable over KVM, where the
 # filesystem is about to be destroyed and journald may never flush.
@@ -113,6 +116,36 @@ check_tools() {
     done
 }
 
+config_drive_devices() {
+    blkid -o device -t LABEL=cidata 2>/dev/null
+    blkid -o device -t LABEL=config-2 2>/dev/null
+}
+
+wait_for_config_drive() {
+    # Wait for the config drive to appear, with a timeout, instead of ordering this unit
+    # after cloud-init and hoping it finishes.
+    #
+    # cloud-init does NOT mount the config drive for us -- read_passphrase() mounts it
+    # itself by label -- but the kernel does have to enumerate the partition first. On
+    # OVHcloud that has happened by the time multi-user.target is reached, so this
+    # normally returns immediately; the loop is here so that a slow disk costs a retry
+    # rather than an install.
+    #
+    # This exists because of what it replaces: the unit carried After=cloud-init.target,
+    # cloud-init stalled, its target was never reached, and the installer consequently
+    # never ran at all. A timeout that reports what it was waiting for is a much better
+    # failure mode than a job that waits forever and says nothing.
+    local waited=0
+    while [ "$waited" -lt "$CONFIG_DRIVE_TIMEOUT_SEC" ]; do
+        [ -n "$(config_drive_devices)" ] && return 0
+        sleep 2
+        waited=$((waited + 2))
+    done
+    warn "no config-drive partition (LABEL=cidata or config-2) after ${CONFIG_DRIVE_TIMEOUT_SEC}s"
+    warn "continuing anyway — read_passphrase will report what it finds"
+    return 0
+}
+
 read_passphrase() {
     # Supplied via cloud-init configDriveUserData, e.g.:
     #   cmesh_luks_passphrase: "correct horse battery staple"
@@ -127,6 +160,8 @@ read_passphrase() {
     # have delivered them to the rootfs already would make login depend on cloud-init's
     # stage ordering relative to this unit, which is not something to hang remote access
     # on. Reading them here is deterministic.
+    wait_for_config_drive
+
     local cd_mnt=/run/cmesh-configdrive dev
     mkdir -p "$cd_mnt"
 
