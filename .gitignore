@@ -1,0 +1,14 @@
+# Packer build output
+build_archlinux/output/
+*.qcow2
+*.qcow2.sha512
+*.qcow2.sha512.txt
+
+# Packer plugin cache
+.packer.d/
+packer_cache/
+*.pkr.hcl.lock.hcl
+
+# Local notes / scratch
+*.log
+.DS_Store

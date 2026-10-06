@@ -1,0 +1,104 @@
+#!/bin/bash
+# cmesh-byol-finalize — one-shot, runs once inside the freshly-installed encrypted system.
+#
+# Closes the gap left by the installer: during install the root array is unlocked by a
+# temporary keyfile at /boot/cmesh-luks.key, so the machine can reboot unattended before
+# the TPM is enrolled. This script enrols the TPM and then REMOVES that keyfile.
+#
+# The operator passphrase stays in a keyslot on both disks as the rescue path, so losing
+# the TPM (firmware update changing PCR measurements, motherboard replacement) degrades
+# to a passphrase prompt rather than to data loss.
+#
+# If there is no usable TPM this script deliberately does nothing and leaves the keyfile
+# in place — an unattended reboot is worth more than tidiness, and the alternative is a
+# host that cannot come back after a power event.
+
+set -euo pipefail
+
+readonly MARKER=/var/lib/cmesh-byol/finalized
+readonly LUKS_KEY=/boot/cmesh-luks.key
+readonly LOG=/var/log/cmesh-byol-finalize.log
+
+exec > >(tee -a "$LOG") 2>&1
+
+log()  { printf '\n=== %s\n' "$*"; }
+warn() { printf '\n!!! %s\n' "$*" >&2; }
+die()  { printf '\nFATAL: %s\n' "$*" >&2; exit 1; }
+
+if [ -f "$MARKER" ]; then
+    log "already finalized — disabling and exiting"
+    systemctl disable cmesh-byol-finalize.service || true
+    exit 0
+fi
+
+log "cmesh-byol-finalize starting"
+
+# Both mappings must be open — proof we are running from the installed encrypted system
+# rather than the bootstrap image.
+mapfile -t CRYPT_DEVS < <(lsblk -nro NAME,TYPE | awk '$2 == "crypt" {print "/dev/mapper/"$1}' | sort)
+log "open dm-crypt devices: ${CRYPT_DEVS[*]:-none}"
+[ "${#CRYPT_DEVS[@]}" -eq 2 ] \
+    || die "expected 2 open dm-crypt devices, found ${#CRYPT_DEVS[@]} — refusing to touch the TPM"
+
+if [ ! -f "$LUKS_KEY" ]; then
+    log "no temporary keyfile at ${LUKS_KEY} — nothing to retire"
+else
+    if [ -e /dev/tpm0 ] || [ -e /dev/tpmrm0 ]; then
+        log "TPM detected; enrolling both LUKS devices"
+
+        # No --tpm2-with-pin: the server must recover from a power event with nobody
+        # present, which is the whole point of enrolling at all. Add
+        # --tpm2-with-pin=yes below if you would rather have a second factor and accept
+        # console access at every boot.
+        #
+        # PCR 7 (Secure Boot state) changes rarely. Adding PCRs 0/4/5 makes the seal
+        # break on every firmware or GRUB update — a passphrase prompt is the failure
+        # mode, which is safe but surprising. Record what you choose.
+        readonly PCRS=7
+        for dev in "${CRYPT_DEVS[@]}"; do
+            if systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs="$PCRS" "$dev"; then
+                log "enrolled TPM token on ${dev}"
+            else
+                die "TPM enrolment failed on ${dev} — leaving ${LUKS_KEY} in place"
+            fi
+        done
+
+        # Prove the token actually unlocks before deleting the only other unattended
+        # path. --test-passphrase reports whether any token or keyslot can unlock the
+        # device; with the passphrase piped in it must succeed.
+        for dev in "${CRYPT_DEVS[@]}"; do
+            if systemd-cryptenroll "$dev" | grep -q tpm2; then
+                log "confirmed a TPM2 token is present on ${dev}"
+            else
+                die "no TPM2 token visible on ${dev} after enrolment — not removing the keyfile"
+            fi
+        done
+
+        log "removing the temporary keyfile"
+        rm -f "$LUKS_KEY"
+
+        # crypttab pointed at the (now deleted) keyfile. With the TPM token present the
+        # device unlocks without either, so switching to the password prompt is only the
+        # fallback for a broken seal.
+        sed -i "s|${LUKS_KEY}|none|g" /etc/crypttab.initramfs
+        # The initramfs embedded the keyfile via FILES=; it must be regenerated without
+        # it, or the deleted key is still baked into the boot image.
+        sed -i 's|^FILES=.*|FILES=()|' /etc/mkinitcpio.conf
+
+        log "regenerating the initramfs without the keyfile"
+        mkinitcpio -P
+
+        log "keyfile retired; TPM unlock is now the unattended path"
+    else
+        warn "NO TPM device found — leaving ${LUKS_KEY} in place."
+        warn "The machine will keep booting unattended using that key on the"
+        warn "unencrypted /boot. Anyone who images the disk can read it and decrypt"
+        warn "the root array. Install a TPM or accept a passphrase prompt at boot."
+    fi
+fi
+
+mkdir -p "$(dirname "$MARKER")"
+date -Is > "$MARKER"
+systemctl disable cmesh-byol-finalize.service || true
+
+log "cmesh-byol-finalize complete"

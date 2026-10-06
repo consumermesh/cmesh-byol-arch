@@ -1,0 +1,20 @@
+[Unit]
+Description=cmesh BYOL finalize (enrol TPM2, retire the temporary unlock keyfile)
+Documentation=https://github.com/consumermesh/cmesh-byol-arch
+# After the encrypted root is up and the network is irrelevant; local-fs is the only
+# ordering that matters, because the keyfile lives on /boot.
+After=local-fs.target
+ConditionPathExists=!/var/lib/cmesh-byol/finalized
+# Only meaningful on the installed system: the installer writes this marker, and its
+# absence means we are still in the bootstrap image (where there is no crypttab to fix).
+ConditionPathExists=/var/lib/cmesh-byol/installed
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/cmesh-byol-finalize
+# Enrolling a TPM keyslot and rebuilding the initramfs can take a minute.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

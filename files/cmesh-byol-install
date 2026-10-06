@@ -1,0 +1,428 @@
+#!/bin/bash
+# cmesh-byol-install — first-boot encrypted install for OVHcloud bare metal.
+#
+# Runs ONCE, from the freshly-deployed BYOL image, and rebuilds both disks as:
+#
+#   p1  512M vfat      ESP (per disk, both bootable)
+#   p2    1G linux-raid ─┐
+#                        ├─ md2 (raid1, ext4) → /boot        [unencrypted, GRUB reads it]
+#   p3  rest  LUKS2 ─┐   │
+#      cryptrootN ───┴───┴─ md3 (raid1, ext4) → /           [encrypted]
+#
+# LUKS sits UNDER the RAID, one header per disk, so a disk failure costs a disk rather
+# than the array. See README for why that ordering is not negotiable.
+#
+# THIS DESTROYS BOTH DISKS. That is its purpose.
+#
+# Every precondition is checked before anything destructive happens, and the completion
+# marker is written only at the very end, so a failure is re-runnable and diagnosable
+# over KVM.
+
+set -euo pipefail
+
+readonly MARKER=/var/lib/cmesh-byol/installed
+readonly WORKDIR=/run/cmesh-byol
+readonly ROOTFS_TAR="$WORKDIR/rootfs.tar.zst"
+readonly MNT=/mnt/cmesh-target
+readonly LOG=/var/log/cmesh-byol-install.log
+readonly MIN_MEM_MIB=8192
+readonly BOOT_MIB=1024
+readonly ESP_MIB=512
+readonly LUKS_KEY=/boot/cmesh-luks.key
+readonly POOL_NAME=md3
+
+# Duplicated to the serial console so a failed install is readable over KVM, where the
+# filesystem is about to be destroyed and journald may never flush.
+exec > >(tee -a "$LOG" /dev/console) 2>&1
+
+log()  { printf '\n=== %s\n' "$*"; }
+warn() { printf '\n!!! %s\n' "$*" >&2; }
+die()  { printf '\nFATAL: %s\n' "$*" >&2; exit 1; }
+
+### Preconditions ###################################################################
+
+check_already_done() {
+    if [ -f "$MARKER" ]; then
+        log "already installed ($MARKER present) — disabling and exiting"
+        systemctl disable cmesh-byol-install.service || true
+        exit 0
+    fi
+}
+
+check_arch() {
+    [ -f /etc/arch-release ] || die "not an Arch system (/etc/arch-release missing)"
+}
+
+check_memory() {
+    local mem_mib
+    mem_mib=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo)
+    log "RAM: ${mem_mib} MiB"
+    # The rootfs is staged in /run (tmpfs) while the disks are destroyed, so this is a
+    # hard floor, not a recommendation.
+    [ "$mem_mib" -ge "$MIN_MEM_MIB" ] \
+        || die "need >= ${MIN_MEM_MIB} MiB RAM to stage the rootfs in tmpfs (have ${mem_mib})"
+    findmnt -no FSTYPE /run | grep -q tmpfs \
+        || die "/run is not tmpfs; there is nowhere safe to stage the rootfs"
+}
+
+check_disks() {
+    # Exactly two whole disks, equal size, no partitions mounted from them. Refusing on
+    # anything else is deliberate: this script partitions everything it finds.
+    mapfile -t DISKS < <(lsblk -dno NAME,TYPE | awk '$2 == "disk" {print "/dev/"$1}' | sort)
+    DISK_COUNT=${#DISKS[@]}
+    log "whole disks detected: ${DISK_COUNT} (${DISKS[*]:-none})"
+    [ "$DISK_COUNT" -eq 2 ] \
+        || die "expected exactly 2 whole disks, found ${DISK_COUNT} — refusing to partition"
+
+    local s0 s1
+    s0=$(blockdev --getsize64 "${DISKS[0]}")
+    s1=$(blockdev --getsize64 "${DISKS[1]}")
+    log "sizes: ${DISKS[0]}=${s0} ${DISKS[1]}=${s1}"
+    [ "$s0" -eq "$s1" ] \
+        || die "disks differ in size (${s0} vs ${s1}); RAID1 needs matching members"
+
+    # Bail if anything from these disks is mounted — partitioning a live member is how
+    # you corrupt the system you are running from.
+    local d mnt
+    for d in "${DISKS[@]}"; do
+        while read -r mnt; do
+            [ -n "$mnt" ] || continue
+            case "$mnt" in
+                /|/boot|/boot/efi) continue ;;   # the bootstrap's own mounts
+                *) die "${d} has a mounted partition at ${mnt}; unmount before installing" ;;
+            esac
+        done < <(lsblk -no MOUNTPOINT "$d" | grep -v '^$' || true)
+    done
+}
+
+check_tools() {
+    local t
+    for t in cryptsetup mdadm sgdisk mkfs.ext4 mkfs.vfat rsync tar zstd \
+             blkid findmnt grub-install grub-mkconfig mkinitcpio; do
+        command -v "$t" >/dev/null 2>&1 || die "required tool missing: $t"
+    done
+}
+
+read_passphrase() {
+    # Supplied via cloud-init configDriveUserData, e.g.:
+    #   cmesh_luks_passphrase: "correct horse battery staple"
+    #
+    # The config drive is a small vfat partition labelled 'cidata' or 'config-2'. It is
+    # read here — before anything is destroyed — and scrubbed later.
+    local cd_mnt=/run/cmesh-configdrive dev
+    mkdir -p "$cd_mnt"
+
+    for dev in $(blkid -o device -t LABEL=cidata 2>/dev/null; blkid -o device -t LABEL=config-2 2>/dev/null); do
+        if mount -o ro "$dev" "$cd_mnt" 2>/dev/null; then
+            if [ -f "$cd_mnt/user-data" ]; then
+                # Take the last match: later keys win, and it tolerates a commented
+                # example line above the real one.
+                LUKS_PASSPHRASE=$(grep -E '^[[:space:]]*cmesh_luks_passphrase:' "$cd_mnt/user-data" \
+                    | tail -1 | sed -E 's/^[^:]*:[[:space:]]*//; s/^["'"'"']//; s/["'"'"']$//')
+            fi
+            umount "$cd_mnt"
+            [ -n "${LUKS_PASSPHRASE:-}" ] && break
+        fi
+    done
+
+    [ -n "${LUKS_PASSPHRASE:-}" ] || die \
+        "no cmesh_luks_passphrase found on the config drive. Set it in configDriveUserData (base64-encoded cloud-config)."
+
+    [ "${#LUKS_PASSPHRASE}" -ge 12 ] || die \
+        "cmesh_luks_passphrase is too short (${#LUKS_PASSPHRASE} chars); use at least 12"
+
+    log "passphrase read from the config drive (${#LUKS_PASSPHRASE} chars)"
+}
+
+### Stage the rootfs ################################################################
+
+stage_rootfs() {
+    log "staging the running rootfs into ${ROOTFS_TAR}"
+
+    mkdir -p "$WORKDIR"
+    rm -f "$ROOTFS_TAR"
+
+    # Exclude virtual filesystems and anything we recreate afterwards. /boot is excluded
+    # because it is a separate unencrypted array in the target layout, and /var/lib/
+    # cmesh-byol because the marker must NOT be carried across (the installed system has
+    # its own, written at the end).
+    tar --one-file-system \
+        --exclude=./proc/*      --exclude=./sys/*       --exclude=./dev/* \
+        --exclude=./run/*       --exclude=./tmp/*       --exclude=./mnt/* \
+        --exclude=./media/*     --exclude=./boot/*      --exclude=./lost+found \
+        --exclude=./var/lib/cmesh-byol \
+        --exclude=./var/log/cmesh-byol-install.log \
+        -C / -cf - . | zstd -T0 -3 -o "$ROOTFS_TAR"
+
+    local size
+    size=$(du -h "$ROOTFS_TAR" | cut -f1)
+    log "staged rootfs: ${size}"
+    [ -s "$ROOTFS_TAR" ] || die "rootfs tarball is empty"
+}
+
+### Partition + encrypt #############################################################
+
+partition_disks() {
+    log "partitioning ${DISKS[*]} — DESTRUCTIVE from here"
+
+    local d
+    for d in "${DISKS[@]}"; do
+        # Drop any existing md superblocks first: leftover metadata on a member makes
+        # assembly pick up the old array.
+        mdadm --zero-superblock "${d}"p2 2>/dev/null || true
+        mdadm --zero-superblock "${d}"p3 2>/dev/null || true
+        wipefs -a "$d"
+        sgdisk --zap-all "$d"
+        sgdisk -n "1:1MiB:+${ESP_MIB}MiB" -t 1:ef00 -c 1:ESP  "$d"
+        sgdisk -n "2:0:+${BOOT_MIB}MiB"   -t 2:fd00 -c 2:boot "$d"
+        sgdisk -n "3:0:0"                 -t 3:8309 -c 3:cryptroot "$d"
+        partprobe "$d" 2>/dev/null || blockdev --rereadpt "$d"
+        udevadm settle
+    done
+}
+
+create_boot_array() {
+    log "creating ${POOL_NAME%3}2 (/boot, raid1, unencrypted)"
+    mdadm --create /dev/md2 --level=1 --raid-devices=2 --metadata=1.2 \
+        --name=boot --run "${DISKS[0]}p2" "${DISKS[1]}p2"
+    mkfs.ext4 -q -L boot /dev/md2
+}
+
+create_encrypted_root() {
+    log "creating LUKS2 containers (one header per disk)"
+
+    local keyfile=$1
+    local i=0 d
+    for d in "${DISKS[@]}"; do
+        # aes-xts-plain64 with a 512-bit key is AES-256-XTS. argon2id is the LUKS2
+        # default and is correct — do not tune it down.
+        cryptsetup luksFormat --type luks2 \
+            --cipher aes-xts-plain64 --key-size 512 \
+            --hash sha256 --pbkdf argon2id \
+            --batch-mode "$d"p3 "$keyfile"
+
+        # The operator passphrase is a SECOND keyslot, so it survives as the rescue path
+        # after the temporary keyfile is deleted at finalize.
+        cryptsetup luksAddKey "$d"p3 "$keyfile" --key-file "$keyfile" \
+            --batch-mode --new-keyfile <(printf '%s' "$LUKS_PASSPHRASE")
+
+        cryptsetup open "$d"p3 "cryptroot${i}" --key-file "$keyfile"
+        udevadm settle
+        i=$((i + 1))
+    done
+
+    log "creating ${POOL_NAME} (/, raid1 over the dm-crypt mappings)"
+    # The members are dm-crypt devices, NOT the raw partitions — this is the whole point.
+    mdadm --create "/dev/${POOL_NAME}" --level=1 --raid-devices=2 --metadata=1.2 \
+        --name=root --run /dev/mapper/cryptroot0 /dev/mapper/cryptroot1
+    mkfs.ext4 -q -L root "/dev/${POOL_NAME}"
+}
+
+### Install into the encrypted root #################################################
+
+extract_rootfs() {
+    log "extracting the rootfs into the encrypted root"
+    mkdir -p "$MNT"
+    mount "/dev/${POOL_NAME}" "$MNT"
+    mkdir -p "$MNT/boot"
+    mount /dev/md2 "$MNT/boot"
+
+    tar --numeric-owner -C "$MNT" -xf "$ROOTFS_TAR"
+    log "rootfs extracted"
+}
+
+write_system_config() {
+    log "writing fstab, crypttab and mkinitcpio configuration"
+
+    # fstab. ZFS-style auto-mounting does not apply; everything is explicit.
+    cat > "$MNT/etc/fstab" <<EOF
+# Generated by cmesh-byol-install. LUKS under RAID1.
+/dev/${POOL_NAME}  /          ext4  defaults                      0 1
+/dev/md2           /boot      ext4  defaults,nofail              0 2
+UUID=$(blkid -s UUID -o value "${DISKS[0]}p1")  /boot/efi  vfat  defaults,nofail,umask=0077  0 2
+EOF
+
+    # crypttab for the INITRAMFS: the root array cannot assemble until both mappings
+    # exist, so these must be unlocked before mdadm runs. Keyed by UUID (device names
+    # are not stable); unlocked during install by the temporary keyfile on /boot, which
+    # cmesh-byol-finalize deletes once the TPM is enrolled.
+    cat > "$MNT/etc/crypttab.initramfs" <<EOF
+# Generated by cmesh-byol-install.
+cryptroot0  UUID=$(cryptsetup luksUUID "${DISKS[0]}p3")  ${LUKS_KEY}  luks,discard
+cryptroot1  UUID=$(cryptsetup luksUUID "${DISKS[1]}p3")  ${LUKS_KEY}  luks,discard
+EOF
+
+    # The installed system's initramfs is NOT the bootstrap's. systemd + sd-encrypt is
+    # correct here (it understands the crypttab above and a TPM2 keyslot without
+    # prompting); mdadm_udev assembles md2/md3 after the mappings appear.
+    #
+    # It could not be done on the running bootstrap because the mappings did not exist
+    # yet — hence this second, deliberate generation inside the target.
+    cat > "$MNT/etc/mkinitcpio.conf" <<'EOF'
+# Generated by cmesh-byol-install.
+MODULES=()
+BINARIES=()
+FILES=(/boot/cmesh-luks.key)
+HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block mdadm_udev sd-encrypt filesystems fsck)
+EOF
+
+    # Carry cloud-init state nowhere: the installed system is not reconfigured by the
+    # config drive, and cloud-init has already served its purpose.
+    rm -f "$MNT/etc/machine-id"
+}
+
+generate_initramfs() {
+    log "generating the initramfs inside the target"
+    # mkinitcpio needs /proc, /sys and /dev, and it reads the keyfile path listed in
+    # FILES=, so the target's /boot must be mounted.
+    for fs in dev proc sys; do
+        mount --rbind "/$fs" "$MNT/$fs"
+        mount --make-rslave "$MNT/$fs"
+    done
+
+    chroot "$MNT" mkinitcpio -P
+
+    for fs in dev proc sys; do
+        umount -R "$MNT/$fs" 2>/dev/null || true
+    done
+    ls -1 "$MNT/boot"/initramfs-*.img >/dev/null 2>&1 \
+        || die "no initramfs was produced in the target"
+}
+
+install_grub() {
+    log "installing GRUB to both ESPs"
+
+    mkdir -p "$MNT/boot/efi"
+    mount "${DISKS[0]}p1" "$MNT/boot/efi"
+
+    for fs in dev proc sys; do
+        mount --rbind "/$fs" "$MNT/$fs"
+        mount --make-rslave "$MNT/$fs"
+    done
+
+    # root= is resolved by sd-encrypt from crypttab, then md3 assembles and mounts. No
+    # hard-coded device name in the cmdline.
+    chroot "$MNT" grub-install --target=x86_64-efi \
+        --efi-directory=/boot/efi --bootloader-id=cmesh --no-nvram --recheck
+
+    chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
+
+    for fs in dev proc sys; do
+        umount -R "$MNT/$fs" 2>/dev/null || true
+    done
+
+    umount "$MNT/boot/efi"
+
+    # Second ESP: the machine must still boot if the first disk fails. Distinct
+    # bootloader-id so the firmware sees two entries rather than one being overwritten.
+    mkfs.vfat -F32 -n ESP2 "${DISKS[1]}p1"
+    mount "${DISKS[1]}p1" "$MNT/boot/efi"
+    for fs in dev proc sys; do
+        mount --rbind "/$fs" "$MNT/$fs"
+        mount --make-rslave "$MNT/$fs"
+    done
+    chroot "$MNT" grub-install --target=x86_64-efi \
+        --efi-directory=/boot/efi --bootloader-id=cmesh2 --no-nvram --recheck
+    for fs in dev proc sys; do
+        umount -R "$MNT/$fs" 2>/dev/null || true
+    done
+    umount "$MNT/boot/efi"
+
+    log "GRUB installed on both ESPs"
+}
+
+scrub_config_drive() {
+    # The passphrase was on the config drive in cleartext. Overwrite it so the only
+    # remaining copy is inside the LUKS keyslots.
+    log "scrubbing the config drive"
+    local dev
+    for dev in $(blkid -o device -t LABEL=cidata 2>/dev/null; blkid -o device -t LABEL=config-2 2>/dev/null); do
+        if ! dd if=/dev/urandom of="$dev" bs=1M count=8 status=none 2>/dev/null; then
+            warn "could not scrub ${dev} — it may be removed with the old partition table"
+        fi
+    done
+    warn "if any config-drive device survived, the passphrase may remain on it"
+}
+
+### Main ############################################################################
+
+main() {
+    log "cmesh-byol-install starting"
+
+    check_already_done
+    check_arch
+    check_memory
+    check_disks
+    check_tools
+    read_passphrase
+
+    stage_rootfs
+
+    # Everything above is non-destructive and re-runnable. From here the disks go.
+    partition_disks
+
+    mkdir -p "$WORKDIR"
+    local keyfile="$WORKDIR/luks.key"
+    # 64 random bytes, and it goes into a SECOND keyslot so the operator passphrase
+    # remains valid after this file is deleted.
+    dd if=/dev/urandom of="$keyfile" bs=64 count=1 status=none
+    chmod 0400 "$keyfile"
+
+    create_boot_array
+    create_encrypted_root "$keyfile"
+
+    extract_rootfs
+    write_system_config
+
+    # The temporary unlock key lives on the (unencrypted) /boot so the machine can
+    # reboot unattended. cmesh-byol-finalize removes it once the TPM is enrolled.
+    cp "$keyfile" "$MNT${LUKS_KEY}"
+    chmod 0400 "$MNT${LUKS_KEY}"
+    rm -f "$keyfile"
+
+    generate_initramfs
+    install_grub
+
+    # Networking. cloud-init configures the BOOTSTRAP image, not the installed system,
+    # so without this the machine comes up encrypted and unreachable.
+    install -Dm644 /dev/stdin "$MNT/etc/systemd/network/20-wired.network" <<'EOF'
+# Generated by cmesh-byol-install.
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes
+EOF
+
+    ln -sf /run/systemd/resolve/stub-resolv.conf "$MNT/etc/resolv.conf"
+
+    # Enable the finalize unit; it is what removes the temporary key.
+    ln -sf /etc/systemd/system/cmesh-byol-finalize.service \
+        "$MNT/etc/systemd/system/multi-user.target.wants/cmesh-byol-finalize.service"
+
+    chroot "$MNT" systemd-machine-id-setup
+    chroot "$MNT" systemctl enable systemd-networkd systemd-resolved 2>/dev/null || true
+
+    sync
+    umount -R "$MNT" 2>/dev/null || true
+
+    scrub_config_drive
+
+    # Marker last: until this exists, a failure leaves the system re-runnable.
+    mkdir -p "$(dirname "$MARKER")"
+    date -Is > "$MARKER"
+    systemctl disable cmesh-byol-install.service || true
+
+    echo
+    log "INSTALL COMPLETE — rebooting into the encrypted system"
+    echo "    After it comes back, verify with the README's 'Verifying an installation'."
+    echo "    The temporary unlock key at /boot/cmesh-luks.key is removed by"
+    echo "    cmesh-byol-finalize once the TPM is enrolled."
+    echo
+    rm -f "$ROOTFS_TAR"
+    sync
+    sleep 2
+    systemctl reboot
+}
+
+main "$@"

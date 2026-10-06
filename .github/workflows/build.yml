@@ -1,0 +1,99 @@
+name: Builder
+
+# Builds the BYOL image and attaches it to a GitHub Release.
+#
+# Release asset URLs are what go into the OVHcloud console / BYOLinux API, so the asset
+# name and checksum file name are part of the interface:
+#
+#   https://github.com/consumermesh/cmesh-byol-arch/releases/download/<tag>/archlinux.qcow2
+#   https://github.com/consumermesh/cmesh-byol-arch/releases/download/<tag>/archlinux.qcow2.sha512
+#
+# Do not rename them without updating the README and every server's configDriveUserData.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # The image is built by booting QEMU with KVM, so a Linux runner with /dev/kvm is
+    # required. The GitHub-hosted ubuntu runners provide it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify KVM is available
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing — the image build needs hardware virtualisation"
+            exit 1
+          fi
+          ls -l /dev/kvm
+
+      - name: Install packer and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils genisoimage
+          curl -fsSL -o /tmp/packer.zip \
+            "https://releases.hashicorp.com/packer/1.11.2/packer_1.11.2_linux_amd64.zip"
+          sudo unzip -o /tmp/packer.zip -d /usr/local/bin
+          packer version
+          qemu-system-x86_64 --version | head -1
+
+      - name: Build image
+        working-directory: build_archlinux
+        env:
+          PACKER_LOG: "1"
+        run: |
+          packer init archlinux.pkr.hcl
+          packer build archlinux.pkr.hcl
+
+      - name: Checksum the image
+        working-directory: build_archlinux
+        run: |
+          test -f output/archlinux.qcow2
+          # sha512 to match OVH's imageCheckSumType: "sha512".
+          sha512sum output/archlinux.qcow2 | awk '{print $1}' > output/archlinux.qcow2.sha512
+          # A bare digest, so the value can be pasted straight into imageCheckSum.
+          sha512sum output/archlinux.qcow2 > output/archlinux.qcow2.sha512.txt
+          echo "--- image ---"
+          ls -lh output/archlinux.qcow2
+          echo "--- sha512 ---"
+          cat output/archlinux.qcow2.sha512
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: archlinux-qcow2
+          path: |
+            build_archlinux/output/archlinux.qcow2
+            build_archlinux/output/archlinux.qcow2.sha512
+            build_archlinux/output/archlinux.qcow2.sha512.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      # Only tag pushes produce a release; a workflow_dispatch run just gives you the
+      # artifact to test with.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" \
+            build_archlinux/output/archlinux.qcow2 \
+            build_archlinux/output/archlinux.qcow2.sha512 \
+            build_archlinux/output/archlinux.qcow2.sha512.txt \
+            --clobber
+          echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
+          echo "imageURL:      https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/archlinux.qcow2" >> "$GITHUB_STEP_SUMMARY"
+          echo "imageCheckSum: $(cat build_archlinux/output/archlinux.qcow2.sha512)" >> "$GITHUB_STEP_SUMMARY"

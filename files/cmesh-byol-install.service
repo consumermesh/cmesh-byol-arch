@@ -1,0 +1,29 @@
+[Unit]
+Description=cmesh BYOL first-boot encrypted install (LUKS2 under RAID1)
+Documentation=https://github.com/consumermesh/cmesh-byol-arch
+# DefaultDependencies=no so this runs early in boot, before anything has a reason to
+# hold the disks. It reboots the machine itself when it succeeds.
+DefaultDependencies=no
+After=sysinit.target local-fs.target
+Before=network-pre.target
+# Never let a failed install be "restarted" into a loop that re-wipes disks. The script
+# exits 0 when the completion marker exists; a genuine failure stops here and is read
+# over the serial console, which the script tees to.
+ConditionPathExists=!/var/lib/cmesh-byol/installed
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Serial console output for KVM diagnosis, plus the journal.
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=3600
+# The install legitimately reboots and destroys filesystems; do not let systemd's
+# sandboxing get in the way of block-device access.
+PrivateDevices=no
+ProtectSystem=no
+ProtectHome=no
+ExecStart=/usr/local/sbin/cmesh-byol-install
+
+[Install]
+WantedBy=multi-user.target
