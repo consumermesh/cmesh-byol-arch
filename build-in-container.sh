@@ -54,13 +54,18 @@ mkdir -p build_archlinux/output
 # The repo is mounted read-only at /src and copied inside the container, so the build
 # cannot modify your working tree. Output is written to /out, which IS the host's
 # build_archlinux/output.
+#
+# NOTE: /work is NOT passed to --workdir. The container creates it below, and a
+# --workdir naming a path that does not exist yet fails before the script runs at all:
+#   Error: workdir "/work" does not exist on container <id>
+# /tmp always exists, so start there and cd once the copy exists.
 "$RUNTIME" run --rm -i \
     "${DEVICES[@]}" \
     --cpus "$CPUS" \
     --memory "$MEMORY" \
     -v "$REPO_DIR:/src:ro" \
     -v "$REPO_DIR/build_archlinux/output:/out" \
-    -w /work \
+    -w /tmp \
     "$IMAGE" \
     bash -euo pipefail -c '
         echo ">>> inside container: $(cat /etc/arch-release 2>/dev/null || echo arch)"
