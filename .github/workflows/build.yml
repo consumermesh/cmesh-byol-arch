@@ -52,6 +52,18 @@ jobs:
       - name: Build image
         env:
           PACKER_LOG: "1"
+          # Packer downloads hashicorp/qemu from the GitHub API on first use. Unauthenticated,
+          # that shares a rate limit per runner IP, and a tag build failed outright on it:
+          #
+          #   403 API rate limit exceeded for 4.151.199.225 ... rate reset in 9m42s
+          #   Failed getting the "github.com/hashicorp/qemu" plugin
+          #
+          # That fails the build before QEMU even starts, for reasons unrelated to the
+          # image. GITHUB_TOKEN is always available and lifts the limit; it needs no extra
+          # permissions, since reading a public repo's tags is all this does.
+          #
+          #   [1] PACKER_GITHUB_API_TOKEN below.
+          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./build.sh
 
       # The artifact is at <repo>/output, NOT build_archlinux/output: output_directory is
