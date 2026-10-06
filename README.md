@@ -367,3 +367,13 @@ Built from the OVH `build_archlinux` example. The install path is **not yet prov
 hardware** — treat the first deployment as a test, keep KVM open, and do not put real
 data on the server until `Verifying an installation` passes and a reboot comes back
 without a passphrase.
+
+## License
+
+[MIT](LICENSE) © 2026 Consumer Mesh, LLC.
+
+Note that this repository builds a Linux image and pulls packages from the Arch Linux
+repositories at build time. Nothing here changes the licensing of those components; the
+MIT grant covers this repository's own scripts and documentation. OVH's
+[bringyourownlinux](https://github.com/ovh/bringyourownlinux) is a separate work under
+its own terms.
