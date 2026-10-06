@@ -151,12 +151,53 @@ install -Dm644 "$FILES_SRC/cmesh-byol-finalize.service" \
 
 # The installer runs on the first boot of the deployed system. It is NOT enabled here:
 # enabling it would make the build VM try to install over its own disks.
-#
-# OVH's deployer does not run an equivalent of make_image_bootable.sh, so the image
-# must arrange its own first boot. A systemd unit gated on the absence of a completion
-# marker is the mechanism — see the WantedBy=multi-user.target unit.
 ln -sf /etc/systemd/system/cmesh-byol-install.service \
     /etc/systemd/system/multi-user.target.wants/cmesh-byol-install.service
+
+### Phase 4b: OVH's required hook file ###
+
+# /root/.ovh/make_image_bootable.sh MUST EXIST, or the deployment aborts before it
+# starts with:
+#   The '/root/.ovh/make_image_bootable.sh' file does not exist.
+#
+# This is a hard requirement of the BYOL contract, independent of whether the hook is
+# useful. OVH's own build_archlinux ships one; this image deliberately omitted it on the
+# reasoning that the hook runs chrooted into the filesystem OVH already laid down, which
+# is too late to change the partition layout. That reasoning was right and the conclusion
+# was wrong: OVH *validates presence*, so the file has to be there even when it has
+# nothing to do.
+#
+# It is intentionally a no-op. Everything this image needs at deploy time happens on
+# first boot, from cmesh-byol-install, which repartitions both disks and installs into
+# the encrypted stack. Doing anything here would be doing it in the wrong place — and
+# OVH runs this before the first reboot, while the disk layout it just created is still
+# the one we are about to replace.
+install -d -m 0755 /root/.ovh
+cat > /root/.ovh/make_image_bootable.sh <<'HOOK'
+#!/bin/bash
+# Required by the OVHcloud BYOL contract. Deliberately does nothing.
+#
+# This image does not configure the deployed system here. It cannot: this hook runs
+# chrooted into the filesystem OVH has already partitioned and formatted, which is after
+# the point where the disk layout could still be changed. The real work happens on the
+# FIRST BOOT of the deployed system, in /usr/local/sbin/cmesh-byol-install, which
+# rewrites both disks as LUKS2 under RAID1 and installs into them.
+#
+# See https://github.com/consumermesh/cmesh-byol-arch
+set -euo pipefail
+
+echo "cmesh-byol-arch: nothing to do here by design."
+echo "  The encrypted install runs on first boot: /usr/local/sbin/cmesh-byol-install"
+echo "  Progress is logged to /var/log/cmesh-byol-install.log and /dev/console."
+HOOK
+
+chmod 0755 /root/.ovh/make_image_bootable.sh
+
+# Fail the build if it is missing: the whole deployment is blocked on this one file, and
+# discovering that from OVH's error message after an upload wastes an hour.
+test -x /root/.ovh/make_image_bootable.sh \
+    || { echo "FATAL: /root/.ovh/make_image_bootable.sh is missing or not executable" >&2; exit 1; }
+echo ">>> OVH hook present: /root/.ovh/make_image_bootable.sh"
 
 rm -rf /tmp/cmesh-byol-files
 

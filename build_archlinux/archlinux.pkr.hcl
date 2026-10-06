@@ -23,14 +23,18 @@ variable "accelerator" {
 # Builds a BYOL-compatible Arch Linux image whose FIRST BOOT on the target bare-metal
 # server re-partitions both disks into LUKS2-under-RAID1 and installs the system into it.
 #
-# Modelled on ovh/bringyourownlinux build_archlinux, with two deliberate differences:
+# Modelled on ovh/bringyourownlinux build_archlinux, with one deliberate difference:
 #
-#   1. No /root/.ovh/make_image_bootable.sh. That hook runs chrooted inside the
-#      filesystem OVH already laid down, which is too late to change the partition
-#      layout or the RAID stacking. Everything interesting happens on first boot
-#      instead, from build_archlinux/files/cmesh-byol-install.
-#   2. The image still satisfies the BYOL contract exactly (single ext4 partition),
-#      because OVH requires that of the image it burns.
+#   OVH's make_image_bootable.sh does real work at deploy time. Here it is a no-op stub
+#   that MUST still exist, because OVH validates its presence and aborts the deployment
+#   without it:
+#     The '/root/.ovh/make_image_bootable.sh' file does not exist.
+#   The hook runs chrooted into the filesystem OVH has already partitioned and formatted,
+#   which is too late to change the disk layout — so everything interesting happens on
+#   FIRST BOOT instead, from build_archlinux/files/cmesh-byol-install. provision.sh
+#   installs the stub; see Phase 4b there.
+#
+# The image still satisfies the rest of the BYOL contract exactly (one ext4 partition).
 
 source "qemu" "baremetal" {
   # Arch Linux cloud image (rolling).
