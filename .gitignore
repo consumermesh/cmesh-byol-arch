@@ -14,6 +14,13 @@ build_archlinux/output.prev.*
 packer_cache/
 *.pkr.hcl.lock.hcl
 
+# The reinstall payload. Per-server and secret-bearing: it carries the LUKS passphrase
+# for that machine in configDriveUserData, plus the SSH key. It must never be committed,
+# and it was not ignored until it had already acquired a passphrase -- one `git add -A`
+# from publishing the only key to the encrypted volume.
+deploy.json
+deploy.json~
+
 # Local notes / scratch
 *.log
 .DS_Store
