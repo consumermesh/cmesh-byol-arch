@@ -33,3 +33,7 @@ deploy.env
 # developed, and `git add -A` published 4.9 MB of them to a public repo twice.
 erl_crash.dump
 deploy.env~
+
+# Emacs autosave and lock files; #deploy.json# would carry the passphrase and SSH key
+#*#
+.#*
