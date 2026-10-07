@@ -50,19 +50,53 @@ defmodule OvhReinstall do
   # Credentials
   # ---------------------------------------------------------------------------
 
+  @env_loaded_key {__MODULE__, :env_loaded}
+
+  # Apply deploy.env to the process environment, once, before ANYTHING reads a setting.
+  #
+  # Doing this per-setting is how OVH_SERVICE_NAME came to be read from the shell while the
+  # credentials came from the file, so a correctly filled deploy.env still failed with
+  # "OVH_SERVICE_NAME is not set". One loader, one place.
+  #
+  # Real environment variables win, so `OVH_SERVICE_NAME=x elixir ...` still overrides the
+  # file for a one-off.
+  def load_env! do
+    unless Process.get(@env_loaded_key) do
+      file = load_env_file()
+
+      Enum.each(file, fn {k, v} ->
+        if System.get_env(k) in [nil, ""], do: System.put_env(k, v)
+      end)
+
+      Process.put(@env_loaded_key, file)
+    end
+
+    :ok
+  end
+
   def credentials! do
-    # .env is read because the application secret is shown exactly once when the token is
-    # created; re-pasting it every run is how it ends up in shell history.
-    env = load_env_file()
+    # deploy.env is read because the application secret is shown exactly once when the
+    # token is created; re-pasting it every run is how it ends up in shell history.
+    load_env!()
 
-    creds = %{
-      application_key: fetch!(env, "OVH_APPLICATION_KEY"),
-      application_secret: fetch!(env, "OVH_APPLICATION_SECRET"),
-      consumer_key: fetch!(env, "OVH_CONSUMER_KEY"),
-      endpoint: env["OVH_ENDPOINT"] || System.get_env("OVH_ENDPOINT") || "ovh-eu"
+    %{
+      application_key: require_env!("OVH_APPLICATION_KEY"),
+      application_secret: require_env!("OVH_APPLICATION_SECRET"),
+      consumer_key: require_env!("OVH_CONSUMER_KEY"),
+      endpoint: System.get_env("OVH_ENDPOINT") || "ovh-eu"
     }
+  end
 
-    creds
+  def service_name! do
+    load_env!()
+
+    System.get_env("OVH_SERVICE_NAME") ||
+      raise """
+      OVH_SERVICE_NAME is not set.
+
+      Set it in deploy.env (next to deploy.json), or export it. It is the server's internal
+      name, e.g. ns5004419.ip-51-222-11.net
+      """
   end
 
   defp load_env_file do
@@ -90,8 +124,8 @@ defmodule OvhReinstall do
     end
   end
 
-  defp fetch!(env, key) do
-    env[key] || System.get_env(key) ||
+  defp require_env!(key) do
+    System.get_env(key) ||
       raise """
       #{key} is not set.
 
@@ -317,9 +351,7 @@ config = OvhReinstall.verify_user_data!(deploy)
 creds = OvhReinstall.credentials!()
 base = OvhReinstall.api_base(creds.endpoint)
 
-service_name =
-  System.get_env("OVH_SERVICE_NAME") ||
-    raise "OVH_SERVICE_NAME is not set (e.g. ns5004419.ip-51-222-11.net)"
+service_name = OvhReinstall.service_name!()
 
 IO.puts("""
 === cmesh-byol-arch reinstall ===
