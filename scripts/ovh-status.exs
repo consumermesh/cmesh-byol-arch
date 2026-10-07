@@ -134,37 +134,72 @@ defmodule OvhStatus do
 
   # --- presentation -------------------------------------------------------------
 
-  # OVHcloud reports progress as "n/m" strings alongside a status word. Rendering it as a
-  # fixed list means the output is comparable between attempts, which matters when the
-  # question is "did it get further than last time".
-  def render(status, elapsed) do
-    IO.puts("\n=== #{status["status"] || "unknown"}   (#{elapsed}s) ===")
+  # The endpoint returns the FULL STEP LIST, not a summary:
+  #
+  #   [%{"comment" => "Checking BIOS version",   "status" => "done",  "error" => ""},
+  #    %{"comment" => "Running Hardware Reboot",  "status" => "doing", "error" => ""},
+  #    %{"comment" => "Running BYOLinux Configure","status" => "todo", "error" => ""}, ...]
+  #
+  # 17 steps, in order, one of them "doing". That is far better than a counter: the step
+  # names say where a deploy died, and every failure this project has had was at
+  # "Running BYOLinux Configure" -- the deploy hook. So the renderer prints the step list
+  # with the running step marked, rather than flattening it to a status word.
+  @step_icon %{"done" => "ok  ", "doing" => ">>> ", "todo" => "    ", "error" => "ERR "}
 
-    case status["progress"] do
-      nil -> :ok
-      p -> IO.puts("progress: #{p}")
+  def steps(status) when is_list(status), do: status
+  def steps(_), do: []
+
+  def render(status, elapsed) when is_list(status) do
+    total = length(status)
+    done = Enum.count(status, &(&1["status"] == "done"))
+    errors = Enum.filter(status, &(&1["status"] == "error"))
+    doing = Enum.find(status, &(&1["status"] == "doing"))
+
+    IO.puts("\n=== #{done}/#{total} steps done   (#{elapsed}s) ===")
+
+    if doing do
+      IO.puts("running: #{doing["comment"]}")
     end
 
-    if msg = status["comment"] || status["message"] do
-      IO.puts("detail  : #{msg}")
+    if errors != [] do
+      IO.puts("\nFAILED:")
+      Enum.each(errors, fn e ->
+        IO.puts("  #{e["comment"]}")
+        if e["error"] not in [nil, ""], do: IO.puts("    #{e["error"]}")
+      end)
     end
 
-    # Anything else the API chose to include, so an unexpected field is visible rather than
-    # silently ignored.
-    known = ~w(status progress comment message)
-    extra = status |> Map.drop(known) |> Enum.reject(fn {_k, v} -> v in [nil, ""] end)
-
-    if extra != [] do
-      IO.puts("other   : #{inspect(Map.new(extra))}")
-    end
+    IO.puts("")
+    Enum.each(status, fn step ->
+      icon = Map.get(@step_icon, step["status"], "?   ")
+      IO.puts("  #{icon}#{step["comment"]}")
+    end)
 
     :ok
   end
 
-  def terminal?(status) do
-    s = String.downcase(to_string(status["status"] || ""))
-    String.contains?(s, ["done", "error", "fail", "cancel"])
+  # Tolerate a flat map too, so an API change degrades to "unrecognised" rather than a crash
+  # in the middle of a deploy.
+  def render(other, elapsed) when is_map(other) do
+    IO.puts("\n=== unrecognised status shape (#{elapsed}s) ===")
+    IO.puts(inspect(other, pretty: true))
+    :ok
   end
+
+  def render(other, elapsed) do
+    IO.puts("\n=== unrecognised status (#{elapsed}s): #{inspect(other)} ===")
+    :ok
+  end
+
+  # Terminal when every step is done, or any step has failed. The deploy is over either
+  # way -- and that is the moment the machine reboots and the FIRST BOOT installer starts,
+  # which is the part no API can report.
+  def terminal?(status) when is_list(status) and status != [] do
+    Enum.any?(status, &(&1["status"] in ["error", "failed", "cancelled"])) or
+      Enum.all?(status, &(&1["status"] == "done"))
+  end
+
+  def terminal?(_), do: false
 end
 
 creds = OvhStatus.credentials!()
@@ -189,13 +224,14 @@ run = fn run ->
           :calendar.datetime_to_gregorian_seconds(t)
     end
 
-  key = {status["status"], status["progress"]}
+  key = status |> OvhStatus.steps() |> Enum.map(&{&1["comment"], &1["status"]})
 
   if key != Process.get(OvhStatus.last_key_key()) do
     Process.put(OvhStatus.last_key_key(), key)
     OvhStatus.render(status, elapsed)
 
-    if status["status"] && String.downcase(to_string(status["status"])) == "done" do
+    if OvhStatus.terminal?(status) and
+         not Enum.any?(OvhStatus.steps(status), &(&1["status"] == "error")) do
       IO.puts("""
 
       >>> The deploy is FINISHED. The machine is rebooting into the deployed image, and the

@@ -28,3 +28,7 @@ deploy.env
 # Local notes / scratch
 *.log
 .DS_Store
+
+# Erlang VM crash dumps. The VM crashed while this project's Elixir scripts were being
+# developed, and `git add -A` published 4.9 MB of them to a public repo twice.
+erl_crash.dump
