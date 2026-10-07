@@ -3,7 +3,8 @@
 #
 # Closes the gap left by the installer: during install the root array is unlocked by a
 # temporary keyfile at /boot/cmesh-luks.key, so the machine can reboot unattended before
-# the TPM is enrolled. This script enrols the TPM and then REMOVES that keyfile.
+# the TPM is enrolled. This script enrols the TPM, rebuilds the initramfs without the
+# keyfile, and only THEN deletes the keyfile and wipes its keyslot.
 #
 # The operator passphrase stays in a keyslot on both disks as the rescue path, so losing
 # the TPM (firmware update changing PCR measurements, motherboard replacement) degrades
@@ -12,12 +13,26 @@
 # If there is no usable TPM this script deliberately does nothing and leaves the keyfile
 # in place — an unattended reboot is worth more than tidiness, and the alternative is a
 # host that cannot come back after a power event.
+#
+# WHAT THE FIRST VERSION GOT WRONG
+#
+# It ran systemd-cryptenroll against /dev/mapper/cryptroot0 -- the PLAINTEXT side of the
+# mapping, which has no LUKS header -- and died with "Failed to load LUKS2 superblock".
+# Had it got past that, it would have hung: with no --unlock-key-file, cryptenroll asks
+# for a passphrase on a TTY the unit does not have. And it deleted the keyfile BEFORE
+# regenerating the initramfs, so a failed mkinitcpio would have left a boot image that
+# still needs a file that no longer exists.
+#
+# Every step below is ordered so that a failure at any point leaves a bootable machine:
+# the keyfile and its keyslot are the last things to go, after the initramfs that no
+# longer needs them has been built and checked.
 
 set -euo pipefail
 
 readonly MARKER=/var/lib/cmesh-byol/finalized
 readonly LUKS_KEY=/boot/cmesh-luks.key
 readonly LOG=/var/log/cmesh-byol-finalize.log
+readonly CRYPTTAB=/etc/crypttab.initramfs
 
 exec > >(tee -a "$LOG") 2>&1
 
@@ -35,10 +50,23 @@ log "cmesh-byol-finalize starting"
 
 # Both mappings must be open — proof we are running from the installed encrypted system
 # rather than the bootstrap image.
-mapfile -t CRYPT_DEVS < <(lsblk -nro NAME,TYPE | awk '$2 == "crypt" {print "/dev/mapper/"$1}' | sort)
-log "open dm-crypt devices: ${CRYPT_DEVS[*]:-none}"
-[ "${#CRYPT_DEVS[@]}" -eq 2 ] \
-    || die "expected 2 open dm-crypt devices, found ${#CRYPT_DEVS[@]} — refusing to touch the TPM"
+mapfile -t CRYPT_NAMES < <(lsblk -nro NAME,TYPE | awk '$2 == "crypt" {print $1}' | sort)
+log "open dm-crypt mappings: ${CRYPT_NAMES[*]:-none}"
+[ "${#CRYPT_NAMES[@]}" -eq 2 ] \
+    || die "expected 2 open dm-crypt mappings, found ${#CRYPT_NAMES[@]} — refusing to touch the TPM"
+
+# The LUKS header is on the BACKING partition (nvme0n1p4), not on the mapping
+# (/dev/mapper/cryptroot0). cryptsetup status names the backing device; that is what
+# cryptenroll, luksDump and luksKillSlot must be given.
+LUKS_DEVS=()
+for name in "${CRYPT_NAMES[@]}"; do
+    dev=$(cryptsetup status "$name" | awk '$1 == "device:" {print $2}')
+    [ -n "$dev" ] && [ -b "$dev" ] || die "could not resolve the backing device of ${name}"
+    [ "$(blkid -o value -s TYPE "$dev")" = "crypto_LUKS" ] \
+        || die "${dev} (behind ${name}) is not a LUKS device"
+    LUKS_DEVS+=("$dev")
+    log "${name} is backed by ${dev}"
+done
 
 if [ ! -f "$LUKS_KEY" ]; then
     log "no temporary keyfile at ${LUKS_KEY} — nothing to retire"
@@ -55,40 +83,101 @@ else
         # break on every firmware or GRUB update — a passphrase prompt is the failure
         # mode, which is safe but surprising. Record what you choose.
         readonly PCRS=7
-        for dev in "${CRYPT_DEVS[@]}"; do
-            if systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs="$PCRS" "$dev"; then
+
+        # Find which keyslot the keyfile occupies, per device, BEFORE a TPM token exists.
+        #
+        # The first run of this script asked AFTER enrolling, with a plain
+        # `cryptsetup open --test-passphrase --key-file`, and cryptsetup answered "Key
+        # slot 2 unlocked" -- slot 2 being the TPM slot it had just created, because
+        # cryptsetup tries tokens before it tries the key file. The script then wiped the
+        # TPM slot and kept the keyfile's, and the next boot prompted for the passphrase.
+        #
+        # Two defences: ask while the only slots are the keyfile and the passphrase, and
+        # tell cryptsetup not to load token plugins at all so only the key file can answer.
+        KEY_SLOTS=()
+        for dev in "${LUKS_DEVS[@]}"; do
+            slot=$(cryptsetup open --test-passphrase --disable-external-tokens \
+                       --key-file "$LUKS_KEY" -v "$dev" 2>&1 \
+                   | sed -n 's/^Key slot \([0-9]\+\) unlocked\.$/\1/p' | head -1)
+            [ -n "$slot" ] || die "the keyfile does not unlock ${dev}; not touching its keyslots"
+            KEY_SLOTS+=("$slot")
+            log "${dev}: keyfile is keyslot ${slot}"
+        done
+
+        for dev in "${LUKS_DEVS[@]}"; do
+            # Idempotent: a re-run after a partial failure must not stack a second token.
+            if systemd-cryptenroll "$dev" 2>/dev/null | grep -q tpm2; then
+                log "${dev} already carries a TPM2 token; not enrolling again"
+                continue
+            fi
+            # --unlock-key-file: cryptenroll needs an existing key to add a slot, and
+            # there is no TTY here to type the passphrase on.
+            if systemd-cryptenroll --unlock-key-file="$LUKS_KEY" \
+                    --tpm2-device=auto --tpm2-pcrs="$PCRS" "$dev"; then
                 log "enrolled TPM token on ${dev}"
             else
                 die "TPM enrolment failed on ${dev} — leaving ${LUKS_KEY} in place"
             fi
         done
 
-        # Prove the token actually unlocks before deleting the only other unattended
-        # path. --test-passphrase reports whether any token or keyslot can unlock the
-        # device; with the passphrase piped in it must succeed.
-        for dev in "${CRYPT_DEVS[@]}"; do
-            if systemd-cryptenroll "$dev" | grep -q tpm2; then
-                log "confirmed a TPM2 token is present on ${dev}"
-            else
-                die "no TPM2 token visible on ${dev} after enrolment — not removing the keyfile"
-            fi
+        # The token must be visible on both headers before anything is retired.
+        for dev in "${LUKS_DEVS[@]}"; do
+            systemd-cryptenroll "$dev" | grep -q tpm2 \
+                || die "no TPM2 token visible on ${dev} after enrolment — not removing the keyfile"
+            log "confirmed a TPM2 token is present on ${dev}"
         done
 
-        log "removing the temporary keyfile"
-        rm -f "$LUKS_KEY"
+        # The slot about to be wiped must not be the one the TPM token is bound to.
+        # luksDump lists, under "Tokens:", each token with its "Keyslot:" line.
+        i=0
+        for dev in "${LUKS_DEVS[@]}"; do
+            slot="${KEY_SLOTS[$i]}"; i=$((i + 1))
+            token_slots=$(cryptsetup luksDump "$dev" \
+                | awk '/^Tokens:/{t=1; next} /^[A-Z]/{t=0} t && /Keyslot:/{print $2}' | tr '\n' ' ')
+            case " ${token_slots} " in
+                *" ${slot} "*) die "${dev}: keyslot ${slot} is bound to a token (token slots: ${token_slots}); refusing to wipe it" ;;
+            esac
+            log "${dev}: token-bound keyslots: ${token_slots:-none}; keyfile slot ${slot} is not among them"
+        done
 
-        # crypttab pointed at the (now deleted) keyfile. With the TPM token present the
-        # device unlocks without either, so switching to the password prompt is only the
-        # fallback for a broken seal.
-        sed -i "s|${LUKS_KEY}|none|g" /etc/crypttab.initramfs
-        # The initramfs embedded the keyfile via FILES=; it must be regenerated without
-        # it, or the deleted key is still baked into the boot image.
+        # crypttab pointed at the keyfile. With the TPM token present the device unlocks
+        # without either, so switching to 'none' leaves the password prompt as the
+        # fallback for a broken seal. The initramfs embedded the keyfile via FILES=; it
+        # must be rebuilt without it, or the key stays baked into the boot image.
+        log "rewriting ${CRYPTTAB} and rebuilding the initramfs without the keyfile"
+        sed -i "s|${LUKS_KEY}|none|g" "$CRYPTTAB"
+        grep -q "${LUKS_KEY}" "$CRYPTTAB" && die "${CRYPTTAB} still names the keyfile"
         sed -i 's|^FILES=.*|FILES=()|' /etc/mkinitcpio.conf
+        mkinitcpio -P || die "mkinitcpio failed — keyfile and keyslots left in place; the machine still boots"
 
-        log "regenerating the initramfs without the keyfile"
-        mkinitcpio -P
+        # Prove the new image is what we think before destroying the old path.
+        img=/boot/initramfs-linux.img
+        lsinitcpio "$img" | grep -q 'cmesh-luks.key' \
+            && die "${img} still contains the keyfile; refusing to delete it"
+        lsinitcpio "$img" | grep -q 'etc/crypttab' \
+            || die "${img} carries no crypttab; refusing to delete the keyfile"
+        log "initramfs rebuilt: crypttab present, keyfile absent"
 
-        log "keyfile retired; TPM unlock is now the unattended path"
+        # Only now is the keyfile dead weight: the boot path no longer reads it, and the
+        # TPM token plus the passphrase are both in the headers. Overwrite before unlink;
+        # /boot is unencrypted ext4 and a plain rm leaves the 64 bytes on disk.
+        log "retiring the keyfile and its keyslots"
+        shred -u -n 1 "$LUKS_KEY" 2>/dev/null || rm -f "$LUKS_KEY"
+        [ ! -e "$LUKS_KEY" ] || die "could not remove ${LUKS_KEY}"
+
+        i=0
+        for dev in "${LUKS_DEVS[@]}"; do
+            slot="${KEY_SLOTS[$i]}"; i=$((i + 1))
+            # Never wipe down to a single slot: the passphrase AND the TPM token must
+            # both survive this. -q (batch) kills the slot without asking for another
+            # passphrase, which is why the count is checked first.
+            n=$(cryptsetup luksDump "$dev" | grep -cE '^\s+[0-9]+: luks2$')
+            [ "$n" -ge 3 ] || die "${dev} has only ${n} keyslot(s); refusing to wipe slot ${slot}"
+            cryptsetup luksKillSlot -q "$dev" "$slot" || die "could not wipe keyslot ${slot} on ${dev}"
+            log "${dev}: wiped keyslot ${slot} ($((n - 1)) keyslots remain)"
+        done
+
+        log "keyfile retired; TPM unlock is now the unattended path, passphrase is the rescue path"
     else
         warn "NO TPM device found — leaving ${LUKS_KEY} in place."
         warn "The machine will keep booting unattended using that key on the"
