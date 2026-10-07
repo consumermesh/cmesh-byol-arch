@@ -21,6 +21,10 @@ packer_cache/
 deploy.json
 deploy.json~
 
+# OVHcloud API credentials for scripts/ovh-reinstall.exs. The application secret is shown
+# once at token creation and grants reinstall rights on the server -- which erases it.
+deploy.env
+
 # Local notes / scratch
 *.log
 .DS_Store

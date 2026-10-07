@@ -20,7 +20,8 @@ RAN=0
 for suite in "$HERE"/*.sh; do
     name="$(basename "$suite")"
     [ "$name" = "run-all.sh" ] && continue
-    [ "$name" = "rescue-probe.sh" ] && continue   # runs on a server, not here
+    [ "$name" = "rescue-probe.sh" ] && continue            # runs on a server, not here
+    [ "$name" = "post-install-probe.sh" ] && continue      # runs on a server, not here
     RAN=$((RAN + 1))
     printf '\n############ %s ############\n' "$name"
     if bash "$suite"; then
@@ -30,6 +31,25 @@ for suite in "$HERE"/*.sh; do
         FAILED=$((FAILED + 1))
     fi
 done
+
+# Elixir suites. These test the OVHcloud request signature and the configDriveUserData
+# validation -- the logic that decides whether a deploy produces a reachable machine.
+if command -v elixir >/dev/null 2>&1; then
+    for suite in "$HERE"/*.exs; do
+        [ -e "$suite" ] || continue
+        name="$(basename "$suite")"
+        RAN=$((RAN + 1))
+        printf '\n############ %s ############\n' "$name"
+        if elixir "$suite"; then
+            printf '>>>> %s: PASS\n' "$name"
+        else
+            printf '>>>> %s: FAIL\n' "$name"
+            FAILED=$((FAILED + 1))
+        fi
+    done
+else
+    printf '\n(skipping .exs suites: elixir not installed)\n'
+fi
 
 printf '\n========================================\n'
 if [ "$FAILED" -eq 0 ]; then
