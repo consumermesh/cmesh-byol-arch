@@ -1,0 +1,97 @@
+#!/bin/bash
+# cmesh-esp-sync — keep the signed unified kernel image on every EFI System Partition.
+#
+#   cmesh-esp-sync sync          copy the signed UKI to EFI/BOOT/BOOTX64.EFI on every ESP
+#   cmesh-esp-sync check FILE    exit 0 if FILE is an Authenticode-signed PE (has a
+#                                certificate table), 1 if not, 2 if not a PE at all
+#
+# The firmware loads \EFI\BOOT\BOOTX64.EFI from whichever ESP it boots. OVHcloud gives
+# this host one ESP per disk and the deploy hook mirrors the loader across them; after
+# cmesh-byol-secureboot the loader IS the kernel, and every kernel update must reach
+# both ESPs or the second disk boots last month's kernel. mkinitcpio rebuilds the UKI,
+# sbctl's post hook signs it, and this runs after both (from /etc/initcpio/post and from
+# a pacman hook) to refuse an unsigned image and to mirror a signed one.
+set -uo pipefail
+
+UKI="${CMESH_UKI:-/boot/efi/EFI/Linux/cmesh-linux.efi}"
+MARKER=/var/lib/cmesh-byol/secureboot-prepared
+ESP_LABEL="${CMESH_ESP_LABEL:-EFI_SYSPART}"
+
+log()  { printf 'cmesh-esp-sync: %s\n' "$*"; }
+warn() { printf 'cmesh-esp-sync: WARNING: %s\n' "$*" >&2; }
+alert() { /usr/local/sbin/cmesh-alert esp-sync "$@" 2>/dev/null || true; }
+
+# Little-endian unsigned integer of <width> bytes at <offset> of <file>.
+le() { od -An -t u"$2" -j "$3" -N "$2" "$1" 2>/dev/null | tr -d ' '; }
+
+pe_signed() { # pe_signed <file> -> 0 signed, 1 unsigned, 2 not a PE32+
+    local f="$1" pe magic ddir rva size
+    [ -f "$f" ] || return 2
+    [ "$(head -c 2 "$f" 2>/dev/null)" = "MZ" ] || return 2
+    pe=$(le "$f" 4 60); [ -n "$pe" ] || return 2
+    [ "$(dd if="$f" bs=1 skip="$pe" count=2 2>/dev/null)" = "PE" ] || return 2
+    magic=$(le "$f" 2 $((pe + 24)))
+    [ "$magic" = "523" ] || return 2            # 0x20b = PE32+ (x86_64 EFI)
+    ddir=$((pe + 24 + 112))                     # data directories, PE32+
+    rva=$(le "$f" 4 $((ddir + 4 * 8)))          # entry 4: certificate table
+    size=$(le "$f" 4 $((ddir + 4 * 8 + 4)))
+    [ -n "$rva" ] && [ -n "$size" ] && [ "$rva" -gt 0 ] && [ "$size" -gt 0 ] && return 0
+    return 1
+}
+
+esp_devices() { blkid -o device -t LABEL="$ESP_LABEL" 2>/dev/null | sort; }
+
+# The ESP in fstab is already mounted at /boot/efi, and vfat refuses a second mount of
+# the same device with different options ("Can't mount, would change RO state"). Use
+# the existing mountpoint when there is one; mount a scratch directory otherwise.
+# Prints the mountpoint; ESP_TMP is set when it must be unmounted afterwards.
+esp_mount() { # esp_mount <dev> [ro]
+    local dev="$1" opts="umask=0077" m
+    [ "${2:-}" = ro ] && opts="ro"
+    m=$(findmnt -nro TARGET -S "$dev" 2>/dev/null | head -1)
+    if [ -n "$m" ]; then ESP_TMP=""; printf '%s\n' "$m"; return 0; fi
+    m=$(mktemp -d) || return 1
+    if mount -o "$opts" "$dev" "$m" 2>/dev/null; then ESP_TMP="$m"; printf '%s\n' "$m"; return 0; fi
+    rmdir "$m" 2>/dev/null; return 1
+}
+esp_umount() { [ -n "${ESP_TMP:-}" ] && { umount "$ESP_TMP" 2>/dev/null; rmdir "$ESP_TMP" 2>/dev/null; }; ESP_TMP=""; }
+
+do_sync() {
+    [ -f "$MARKER" ] || { log "not prepared for Secure Boot (${MARKER} absent); nothing to mirror"; return 0; }
+    [ -f "$UKI" ] || { alert "UKI ${UKI} is missing; BOOTX64.EFI NOT updated"; return 1; }
+    if ! pe_signed "$UKI"; then
+        # sbctl's own mkinitcpio post hook normally signed it already; this is the
+        # belt to that brace, and covers a manual `mkinitcpio -P` with hooks disabled.
+        if command -v sbctl >/dev/null && sbctl sign "$UKI" >/dev/null 2>&1 && pe_signed "$UKI"; then
+            log "signed ${UKI}"
+        else
+            alert "${UKI} is NOT signed and could not be signed; BOOTX64.EFI NOT updated (the machine still boots the previous signed image)"
+            return 1
+        fi
+    fi
+    local dev mnt n=0 fail=0
+    for dev in $(esp_devices); do
+        if mnt=$(esp_mount "$dev"); then
+            mkdir -p "$mnt/EFI/BOOT"
+            if cmp -s "$UKI" "$mnt/EFI/BOOT/BOOTX64.EFI"; then
+                log "${dev}: BOOTX64.EFI already current"
+            elif cp -f "$UKI" "$mnt/EFI/BOOT/BOOTX64.EFI.new" && sync && mv -f "$mnt/EFI/BOOT/BOOTX64.EFI.new" "$mnt/EFI/BOOT/BOOTX64.EFI" && sync; then
+                log "${dev}: BOOTX64.EFI updated ($(stat -c %s "$UKI") bytes)"
+            else
+                warn "${dev}: could not write BOOTX64.EFI"; fail=$((fail + 1))
+            fi
+            esp_umount; n=$((n + 1))
+        else
+            warn "${dev}: could not mount"; fail=$((fail + 1))
+        fi
+    done
+    [ "$n" -gt 0 ] || { alert "no ESP with LABEL=${ESP_LABEL} found; BOOTX64.EFI NOT updated"; return 1; }
+    [ "$fail" -eq 0 ] || { alert "${fail} ESP(s) failed to update; the disks may boot different kernels"; return 1; }
+    log "mirrored to ${n} ESP(s)"
+}
+
+case "${1:-}" in
+    sync)  do_sync ;;
+    check) pe_signed "${2:?file}" ;;
+    *) echo "usage: cmesh-esp-sync sync | check FILE" >&2; exit 64 ;;
+esac

@@ -252,5 +252,82 @@ check "root is refused as the admin name" yes "$(has "$INSTALLER" 'cmesh_admin_u
 check "the harden script's default admin name matches the installer's" "admin" "$(sed -nE 's/^ADMIN_USER="\$\{CMESH_ADMIN_USER:-([a-z]+)\}"$/\1/p' "$HARDEN")"
 
 echo
+echo "(13) Secure Boot: cmesh-byol-secureboot cannot brick the box"
+SB="$H/cmesh-byol-secureboot"
+bash -n "$SB" 2>/dev/null; check "bash -n cmesh-byol-secureboot" 0 $?
+check "status needs no root and runs no preflight" 0 "$(code "$SB" | sed -n '/^status()/,/^}/p' | grep -c 'preflight\|id -u')"
+check "prepare: refuses outside the finalized system" yes "$(has "$SB" 'finalized" \] \|\| die')"
+check "prepare: refuses without UEFI" yes "$(has "$SB" '/sys/firmware/efi \] \|\| die "not booted via UEFI"')"
+check "prepare: cmdline is root=UUID + GRUB_CMDLINE_LINUX" yes "$(has "$SB" 'new="root=UUID=\$\{root_uuid\} rw\$\{grub_cl:\+ \$grub_cl\}"')"
+check "prepare: warns when console= is missing" yes "$(has "$SB" 'no console= on the command line')"
+check "prepare: default_image is kept (GRUB fallback)" no "$(has "$SB" "sed -i.*default_image=.*/d")"
+check "prepare: UKI must be larger than the kernel" yes "$(has "$SB" 'is smaller than the kernel; not a UKI')"
+check "prepare: signs with -s (registered for sbctl sign-all)" yes "$(has "$SB" 'sbctl sign -s "\$UKI"')"
+check "prepare: signature verified after signing" yes "$(before "$SB" 'sbctl sign -s "\$UKI"' 'carries no signature after sbctl sign')"
+check "prepare: GRUB saved before BOOTX64.EFI is replaced" yes "$(before "$SB" 'grub-fallback.efi" && sync' 'cmesh-esp-sync sync || die')"
+check "prepare: never overwrites an existing fallback" yes "$(has "$SB" '\[ ! -f "\$mnt/EFI/cmesh/grub-fallback.efi" \]')"
+check "prepare: marker written before sync (sync refuses without it)" yes "$(before "$SB" 'date -Is > "\$P_MARK"' 'cmesh-esp-sync sync || die')"
+check "prepare: does NOT touch the TPM token" 0 "$(code "$SB" | sed -n '/^prepare()/,/^}/p' | grep -c cryptenroll)"
+check "prepare: does NOT enrol keys" 0 "$(code "$SB" | sed -n '/^prepare()/,/^}/p' | grep -c enroll-keys)"
+check "enroll: requires prepare" yes "$(has "$SB" '\[ -f "\$P_MARK" \] \|\| die "run prepare first')"
+check "enroll: requires Setup Mode with KVM instructions" yes "$(has "$SB" 'setup_mode \|\| die "firmware is not in Setup Mode. Over the OVHcloud KVM')"
+check "enroll: every ESP must hold the current UKI before keys go in" yes "$(before "$SB" 'is not the current signed UKI; run prepare again' 'sbctl enroll-keys -m')"
+check "enroll: PCR-less token before enroll-keys" yes "$(before "$SB" 'reseal "\$dev" ""' 'sbctl enroll-keys -m')"
+check "enroll: passphrase slot required before touching the token" yes "$(before "$SB" 'has no passphrase slot; refusing to touch its TPM token' 'reseal "\$dev" ""')"
+check "reseal: tries the existing TPM token first" yes "$(has "$SB" 'systemd-cryptenroll --unlock-tpm2-device=auto --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs="\$pcrs" "\$dev"')"
+check "reseal: passphrase fallback only with a terminal (never blocks the finish unit)" yes "$(before "$SB" '\[ -t 0 \] || { warn' 'systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs="\$pcrs" "\$dev"$')"
+check "enroll and finish both go through reseal" 2 "$(code "$SB" | grep -c '^        reseal "\$dev" ')"
+check "no cryptenroll call outside reseal" 0 "$(code "$SB" | sed '/^reseal()/,/^}/d' | grep -c 'systemd-cryptenroll --')"
+check "enroll: Microsoft certs kept (-m) for option ROMs and rescue" yes "$(has "$SB" 'sbctl enroll-keys -m -t .*|| sbctl enroll-keys -m ')"
+check "enroll: failure after re-seal alerts and says how to recover" yes "$(has "$SB" 'TPM token is PCR-less — run finish after fixing')"
+check "enroll: finish unit enabled only after enrolment" yes "$(before "$SB" 'date -Is > "\$E_MARK"' 'systemctl enable cmesh-byol-secureboot-finish.service >/dev/null 2>&1 && ok')"
+check "finish: refuses while Secure Boot is off, alerts, retries next boot" yes "$([ "$(has "$SB" 'Secure Boot is NOT enforcing on this boot')" = yes ] && [ "$(has "$SB" 'die "Secure Boot is off; not binding the TPM to it"')" = yes ] && echo yes || echo no)"
+check "finish: binds to PCR 7" yes "$([ "$(has "$SB" '^PCRS=7$')" = yes ] && [ "$(has "$SB" 'reseal "\$dev" "\$PCRS"')" = yes ] && echo yes || echo no)"
+check "finish: SB check before the re-seal" yes "$(before "$SB" 'ok "Secure Boot: enforcing"' 'reseal "\$dev" "\$PCRS"')"
+check "finish: marker only after every device is sealed" yes "$(before "$SB" 'reseal "\$dev" "\$PCRS"' 'date -Is > "\$F_MARK"')"
+check "unit: runs only between enrolled and finished" yes "$([ "$(has "$H/cmesh-byol-secureboot-finish.service" '^ConditionPathExists=/var/lib/cmesh-byol/secureboot-enrolled$')" = yes ] && [ "$(has "$H/cmesh-byol-secureboot-finish.service" '^ConditionPathExists=!/var/lib/cmesh-byol/secureboot-finished$')" = yes ] && echo yes || echo no)"
+check "harden installs sbctl" yes "$(code "$HARDEN" | grep -q '^PKGS=.* sbctl)' && echo yes || echo no)"
+check "harden enables the finish unit (inert until enroll)" yes "$(code "$HARDEN" | sed -n '/^UNITS=(/,/)/p' | grep -q 'cmesh-byol-secureboot-finish.service' && echo yes || echo no)"
+check "initcpio post hook sorts after sbctl's" yes "$([[ "zz-cmesh-esp-sync" > "sbctl" ]] && echo yes || echo no)"
+check "pacman hook sorts after zz-sbctl.hook" yes "$([[ "zzz-cmesh-esp-sync.hook" > "zz-sbctl.hook" ]] && echo yes || echo no)"
+check "esp-sync refuses an unsigned image (alerts, keeps the old one)" yes "$(has "$H/cmesh-esp-sync" 'is NOT signed and could not be signed; BOOTX64.EFI NOT updated')"
+check "esp-sync is a no-op before prepare" yes "$(has "$H/cmesh-esp-sync" 'not prepared for Secure Boot')"
+check "esp-sync writes then renames (never a half-written loader)" yes "$(has "$H/cmesh-esp-sync" 'BOOTX64.EFI.new" && sync && mv -f')"
+# Found on the server: the fstab ESP is mounted at /boot/efi and vfat refuses a second
+# mount ("Can't mount, would change RO state"), so the second disk was skipped.
+for f in "$SB" "$H/cmesh-esp-sync"; do
+    check "$(basename "$f"): reuses an existing mount of the ESP (findmnt -S)" yes "$(has "$f" 'findmnt -nro TARGET -S "\$dev"')"
+    check "$(basename "$f"): no direct mount of an ESP outside esp_mount" 0 "$(code "$f" | sed '/^esp_mount()/,/^}/d' | grep -cE 'mount -o (ro|umask=0077) "\$dev"')"
+    check "$(basename "$f"): no hostname(1) (not in the image)" no "$(has "$f" 'hostname)')"
+done
+check "harden --status: no hostname(1)" no "$(has "$HARDEN" 'hostname)')"
+check "PE check reads 2 bytes of the PE signature (no null bytes into bash)" yes "$(has "$H/cmesh-esp-sync" 'count=2 2>/dev/null)" = "PE"')"
+check "prepare: root=/rw/ro stripped from GRUB_CMDLINE_LINUX before composing" yes "$(has "$SB" "grep -vE '\^\(root=\|rootflags=\|rw\\\$\|ro\\\$\|\\\$\)'")"
+
+echo
+echo "(14) cmesh-esp-sync check: a real PE32+ parser"
+# Build minimal PE32+ images: MZ header, e_lfanew at 0x3c -> "PE\0\0", COFF (20 bytes),
+# optional header with magic 0x20b, 16 data directories; entry 4 = certificate table.
+mkpe() { # mkpe <out> <cert-rva> <cert-size>
+    local out="$1" rva="$2" size="$3"
+    { printf 'MZ'; head -c 58 /dev/zero; printf '\x80\x00\x00\x00'; head -c 64 /dev/zero   # e_lfanew = 0x80
+      printf 'PE\0\0'; head -c 20 /dev/zero                                                 # COFF
+      printf '\x0b\x02'; head -c 110 /dev/zero                                              # magic 0x20b + rest of std/windows fields
+      head -c 32 /dev/zero                                                                  # dirs 0-3
+      printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $((rva & 255)) $((rva >> 8 & 255)) $((rva >> 16 & 255)) $((rva >> 24 & 255)))"
+      printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $((size & 255)) $((size >> 8 & 255)) $((size >> 16 & 255)) $((size >> 24 & 255)))"
+      head -c 88 /dev/zero; } > "$out"
+}
+mkpe "$WORK/signed.efi" 4096 1234
+mkpe "$WORK/unsigned.efi" 0 0
+printf 'not a PE at all' > "$WORK/text.bin"
+"$H/cmesh-esp-sync" check "$WORK/signed.efi";   check "PE32+ with a certificate table: signed (0)" 0 $?
+"$H/cmesh-esp-sync" check "$WORK/unsigned.efi"; check "PE32+ with an empty certificate table: unsigned (1)" 1 $?
+"$H/cmesh-esp-sync" check "$WORK/text.bin";     check "not a PE: 2" 2 $?
+"$H/cmesh-esp-sync" check "$WORK/nonexistent";  check "missing file: 2" 2 $?
+export CMESH_ESP_LABEL=NO_SUCH_LABEL_$$ CMESH_UKI="$WORK/signed.efi"
+"$H/cmesh-esp-sync" sync >/dev/null 2>&1;       check "sync without the prepared marker is a no-op (0)" 0 $?
+
+echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

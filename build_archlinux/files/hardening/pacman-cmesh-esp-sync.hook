@@ -1,0 +1,15 @@
+# /etc/pacman.d/hooks/zzz-cmesh-esp-sync.hook — sorts after zz-sbctl.hook so the UKI is
+# signed before it is mirrored. Covers the case where a transaction touched the ESP
+# without rebuilding the initramfs.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Path
+Target = boot/*
+Target = usr/lib/modules/*/vmlinuz
+
+[Action]
+Description = Mirroring the signed kernel image to every ESP...
+When = PostTransaction
+Exec = /usr/local/sbin/cmesh-esp-sync sync

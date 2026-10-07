@@ -1,0 +1,336 @@
+#!/bin/bash
+# cmesh-byol-secureboot — close the boot-chain gap: Secure Boot with this host's own
+# keys, the kernel booted directly by the firmware as a signed unified kernel image
+# (UKI), and the LUKS TPM token bound to that state.
+#
+# WHY
+#
+# The TPM unlocks the root array when PCR 7 matches. PCR 7 is the Secure Boot state.
+# With Secure Boot OFF, PCR 7 is identical for any operating system booted on this
+# hardware, so anyone who can boot the box (OVHcloud rescue, a netboot, a USB stick via
+# the KVM) gets the root key from the TPM without a passphrase. The disks are encrypted
+# against being pulled; the machine itself is not.
+#
+# With Secure Boot ON and only this host's db certificate (plus Microsoft's, for the
+# firmware's own option ROMs and the provider's rescue tooling), PCR 7 also records
+# WHICH certificate verified the loaded image. Only an image signed by the key on this
+# encrypted root reproduces it. A Microsoft-signed shim, a vendor rescue kernel, or an
+# unsigned loader all boot (if their certificate is enrolled) but all produce a different
+# PCR 7, and the TPM says no.
+#
+# WHY A UKI AND NO BOOTLOADER
+#
+# GRUB under Secure Boot without shim does not verify the kernel it loads, so a signed
+# GRUB plus an editable grub.cfg is a signed door with no lock. A UKI is one PE binary:
+# systemd-stub + kernel + initramfs + the command line, signed as a unit; the firmware
+# verifies all of it and nothing in it can be edited. It sits at \EFI\BOOT\BOOTX64.EFI
+# where OVHcloud's efiBootloaderPath already points. GRUB is kept on the ESP as a
+# fallback for the day Secure Boot is turned off again.
+#
+# THREE STEPS, TWO REBOOTS, EACH ONE CHECKABLE
+#
+#   prepare   keys created, UKI built and signed, installed as BOOTX64.EFI on every ESP,
+#             GRUB moved to EFI/cmesh/grub-fallback.efi. Secure Boot still off, the TPM
+#             token untouched. REBOOT: proves the UKI boots on this hardware. If it does
+#             not, the OVHcloud KVM boots EFI/cmesh/grub-fallback.efi and nothing is lost.
+#   enroll    needs the firmware in Setup Mode (BIOS via the KVM: Secure Boot ->
+#             clear/delete keys / custom mode). Clearing the keys already changes
+#             PCR 7, so the boot after it asks for the passphrase once; that is
+#             expected. Re-seals the TPM token with NO PCR policy (asking for the
+#             passphrase if the old token no longer unseals), enrols PK/KEK/db
+#             (+ Microsoft), enables the finish unit. REBOOT: Secure Boot on.
+#   finish    runs from cmesh-byol-secureboot-finish.service on that boot: confirms
+#             Secure Boot is enforcing and the running image is ours, re-seals the TPM
+#             token to PCR 7, wipes the PCR-less one. If Secure Boot is off it alerts
+#             and tries again next boot. Can be run by hand.
+#
+# WHAT IT COSTS
+#
+#   * OVHcloud rescue mode and a re-deploy load unsigned images. With Secure Boot on
+#     they fail until Secure Boot is disabled from the BIOS over the KVM. Keep the KVM
+#     access path working; that is now the recovery path.
+#   * The private signing key is at /var/lib/sbctl/keys on the encrypted root. Lose the
+#     root, lose the key: a rebuilt host enrols a new one.
+#   * PCR 7 alone does not stop a rollback to an OLDER image signed by the same key.
+#     Binding PCR 11 with signed policies (systemd-measure) closes that; not done here.
+#
+# Usage: cmesh-byol-secureboot status | prepare | enroll | finish
+set -uo pipefail
+
+STATE=/var/lib/cmesh-byol
+P_MARK="$STATE/secureboot-prepared"
+E_MARK="$STATE/secureboot-enrolled"
+F_MARK="$STATE/secureboot-finished"
+ESP=/boot/efi
+UKI="$ESP/EFI/Linux/cmesh-linux.efi"
+CMDLINE=/etc/kernel/cmdline
+PRESET=/etc/mkinitcpio.d/linux.preset
+LOG=/var/log/cmesh-byol-secureboot.log
+PCRS=7
+ESP_LABEL=EFI_SYSPART
+
+log()  { printf '\n=== %s\n' "$*"; }
+ok()   { printf '  ok    %s\n' "$*"; }
+warn() { printf '  WARN  %s\n' "$*" >&2; }
+die()  { printf '\nFATAL: %s\n' "$*" >&2; exit 1; }
+alert() { /usr/local/sbin/cmesh-alert secureboot "$@" 2>/dev/null || true; }
+
+sb_json() { sbctl status --json 2>/dev/null; }
+sb_field() { sb_json | tr -d ' \n' | grep -oE "\"$1\":[a-z]+" | cut -d: -f2; }
+secure_boot_on() { [ "$(sb_field secure_boot)" = "true" ]; }
+setup_mode()     { [ "$(sb_field setup_mode)" = "true" ]; }
+keys_exist()     { [ -f /var/lib/sbctl/keys/db/db.key ]; }
+signed()         { /usr/local/sbin/cmesh-esp-sync check "$1"; }
+esp_devices()    { blkid -o device -t LABEL="$ESP_LABEL" 2>/dev/null | sort; }
+
+# The fstab ESP is already mounted at /boot/efi and vfat refuses a second mount of the
+# same device ("Can't mount, would change RO state"); reuse the mountpoint when there
+# is one. Prints it; ESP_TMP is set when esp_umount must unmount it.
+esp_mount() { # esp_mount <dev> [ro]
+    local dev="$1" opts="umask=0077" m
+    [ "${2:-}" = ro ] && opts="ro"
+    m=$(findmnt -nro TARGET -S "$dev" 2>/dev/null | head -1)
+    if [ -n "$m" ]; then ESP_TMP=""; printf '%s\n' "$m"; return 0; fi
+    m=$(mktemp -d) || return 1
+    if mount -o "$opts" "$dev" "$m" 2>/dev/null; then ESP_TMP="$m"; printf '%s\n' "$m"; return 0; fi
+    rmdir "$m" 2>/dev/null; return 1
+}
+esp_umount() { [ -n "${ESP_TMP:-}" ] && { umount "$ESP_TMP" 2>/dev/null; rmdir "$ESP_TMP" 2>/dev/null; }; ESP_TMP=""; }
+
+luks_devices() {
+    local name dev
+    for name in $(lsblk -nro NAME,TYPE | awk '$2 == "crypt" {print $1}' | sort); do
+        dev=$(cryptsetup status "$name" 2>/dev/null | awk '$1 == "device:" {print $2}')
+        [ -b "$dev" ] && echo "$dev"
+    done
+}
+tpm_slots() { systemd-cryptenroll "$1" 2>/dev/null | awk '$2 == "tpm2" {print $1}' | tr '\n' ' '; }
+
+# Replace the TPM token with one sealed to <pcrs> ("" = no PCR policy). Unlocks through
+# the existing token when it still unseals; when it does not -- which is the normal case
+# right after the firmware key store was cleared, since that alone changes PCR 7 -- asks
+# for the LUKS passphrase on the terminal. Without a terminal that is a failure, not a
+# hang: the finish unit must never block boot waiting for input.
+reseal() { # reseal <dev> <pcrs>
+    local dev="$1" pcrs="$2"
+    if systemd-cryptenroll --unlock-tpm2-device=auto --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs="$pcrs" "$dev" >/dev/null 2>&1; then
+        return 0
+    fi
+    [ -t 0 ] || { warn "${dev}: the current TPM token does not unseal (PCR 7 changed) and there is no terminal for the passphrase"; return 1; }
+    warn "${dev}: the current TPM token does not unseal (PCR 7 changed since it was sealed); enter the LUKS passphrase"
+    systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs="$pcrs" "$dev"
+}
+pw_slots()  { systemd-cryptenroll "$1" 2>/dev/null | awk '$2 == "password" {print $1}' | wc -l; }
+
+### status ##############################################################################
+
+status() {
+    echo "cmesh-byol-secureboot status on $(uname -n) ($(date -Is))"
+    echo "  firmware:     $( [ -d /sys/firmware/efi ] && echo UEFI || echo 'NOT UEFI' )"
+    echo "  secure boot:  $(secure_boot_on && echo ENABLED || echo off)   setup mode: $(setup_mode && echo yes || echo no)"
+    echo "  sbctl keys:   $(keys_exist && echo present || echo none)"
+    echo "  steps:        prepared=$([ -f "$P_MARK" ] && cat "$P_MARK" || echo no)  enrolled=$([ -f "$E_MARK" ] && cat "$E_MARK" || echo no)  finished=$([ -f "$F_MARK" ] && cat "$F_MARK" || echo no)"
+    echo "  UKI:          $( [ -f "$UKI" ] && echo "${UKI} $(stat -c %s "$UKI") bytes, $(signed "$UKI" && echo signed || echo UNSIGNED)" || echo "none at ${UKI}")"
+    echo "  cmdline:      $(cat "$CMDLINE" 2>/dev/null || echo "none at ${CMDLINE}")"
+    local dev mnt f
+    for dev in $(esp_devices); do
+        if mnt=$(esp_mount "$dev" ro); then
+            f="$mnt/EFI/BOOT/BOOTX64.EFI"
+            if [ -f "$f" ]; then
+                if cmp -s "$f" "$UKI" 2>/dev/null; then echo "  ${dev}: BOOTX64.EFI = current UKI ($(signed "$f" && echo signed || echo UNSIGNED))"
+                elif signed "$f"; then echo "  ${dev}: BOOTX64.EFI signed but NOT the current UKI ($(stat -c %s "$f") bytes)"
+                else echo "  ${dev}: BOOTX64.EFI unsigned ($(stat -c %s "$f") bytes; $( [ -f "$mnt/EFI/cmesh/grub-fallback.efi" ] && echo "fallback GRUB present" || echo "probably GRUB"))"; fi
+            else echo "  ${dev}: no BOOTX64.EFI"; fi
+            esp_umount
+        else echo "  ${dev}: could not mount"; fi
+    done
+    for dev in $(luks_devices); do
+        echo "  ${dev}: tpm2 slot(s): $(tpm_slots "$dev")password slots: $(pw_slots "$dev")"
+    done
+    [ -f "$F_MARK" ] || echo "  next:         $( [ -f "$E_MARK" ] && echo 'reboot, then finish runs itself (or: cmesh-byol-secureboot finish)' || { [ -f "$P_MARK" ] && echo 'reboot to prove the UKI boots, then: cmesh-byol-secureboot enroll' || echo 'cmesh-byol-secureboot prepare'; })"
+}
+
+### shared checks #######################################################################
+
+preflight() {
+    [ "$(id -u)" -eq 0 ] || die "must run as root"
+    [ -d /sys/firmware/efi ] || die "not booted via UEFI"
+    [ -f "$STATE/finalized" ] || die "this is not the finalized encrypted system (${STATE}/finalized missing); run after cmesh-byol-finalize"
+    command -v sbctl >/dev/null || pacman -S --noconfirm --needed sbctl >/dev/null || die "sbctl is not installed and pacman could not install it"
+    [ -x /usr/local/sbin/cmesh-esp-sync ] || die "/usr/local/sbin/cmesh-esp-sync missing; run cmesh-byol-harden first"
+    [ -f /usr/lib/systemd/boot/efi/linuxx64.efi.stub ] || die "systemd-stub missing (/usr/lib/systemd/boot/efi/linuxx64.efi.stub)"
+    mkdir -p "$STATE"
+    if ! findmnt -no TARGET "$ESP" >/dev/null 2>&1; then
+        mount "$ESP" 2>/dev/null || mount -o umask=0077 "$(esp_devices | head -1)" "$ESP" \
+            || die "could not mount an ESP at ${ESP}"
+    fi
+    [ "$(findmnt -no FSTYPE "$ESP")" = vfat ] || die "${ESP} is not vfat"
+}
+
+### prepare #############################################################################
+
+prepare() {
+    preflight
+    log "prepare: keys"
+    if keys_exist; then ok "sbctl keys present at /var/lib/sbctl/keys"
+    else sbctl create-keys >/dev/null 2>&1 && ok "sbctl keys created" || die "sbctl create-keys failed"; fi
+    chmod 0700 /var/lib/sbctl /var/lib/sbctl/keys 2>/dev/null
+
+    # The command line is what GRUB has been booting (it carries the deployer's
+    # console= and the hardening's lsm=/audit=) plus the root, named by filesystem
+    # UUID: the UKI has no grub.cfg to resolve /dev/md3 against.
+    log "prepare: kernel command line"
+    local grub_cl root_uuid new
+    # The installer already put root= into GRUB_CMDLINE_LINUX; drop any root=/rw/ro so
+    # the line carries each exactly once, with the root this system is running from.
+    grub_cl=$(sed -nE 's/^GRUB_CMDLINE_LINUX="(.*)"$/\1/p' /etc/default/grub 2>/dev/null | tail -1 \
+        | tr ' ' '\n' | grep -vE '^(root=|rootflags=|rw$|ro$|$)' | tr '\n' ' ' | sed 's/ $//')
+    root_uuid=$(findmnt -no UUID /)
+    [ -n "$root_uuid" ] || die "could not determine the root filesystem UUID"
+    new="root=UUID=${root_uuid} rw${grub_cl:+ $grub_cl}"
+    if [ -f "$CMDLINE" ] && [ "$(cat "$CMDLINE")" = "$new" ]; then ok "${CMDLINE} unchanged"
+    else printf '%s\n' "$new" > "$CMDLINE"; ok "${CMDLINE}: ${new}"; fi
+    case " $new " in *" console="*) ;; *) warn "no console= on the command line; the serial console will be silent" ;; esac
+
+    log "prepare: mkinitcpio preset"
+    [ -f "$PRESET" ] || die "${PRESET} missing"
+    if grep -qE "^default_uki=\"${UKI}\"$" "$PRESET"; then ok "preset already builds ${UKI}"
+    else
+        sed -i -E '/^#?default_uki=/d' "$PRESET"
+        sed -i -E "s|^(default_image=.*)$|\1\ndefault_uki=\"${UKI}\"|" "$PRESET"
+        grep -qE "^default_uki=\"${UKI}\"$" "$PRESET" || printf 'default_uki="%s"\n' "$UKI" >> "$PRESET"
+        ok "preset: default_uki=\"${UKI}\" (default_image kept for the GRUB fallback)"
+    fi
+    mkdir -p "$(dirname "$UKI")"
+
+    log "prepare: build and sign the UKI"
+    mkinitcpio -P >/dev/null 2>"$LOG.mkinitcpio" || { cat "$LOG.mkinitcpio" >&2; die "mkinitcpio -P failed"; }
+    rm -f "$LOG.mkinitcpio"
+    [ -s "$UKI" ] || die "mkinitcpio did not produce ${UKI}"
+    [ "$(stat -c %s "$UKI")" -gt "$(stat -c %s /boot/vmlinuz-linux)" ] || die "${UKI} is smaller than the kernel; not a UKI"
+    sbctl sign -s "$UKI" >/dev/null 2>&1 || die "sbctl sign failed on ${UKI}"
+    signed "$UKI" || die "${UKI} carries no signature after sbctl sign"
+    ok "${UKI}: $(stat -c %s "$UKI") bytes, signed, registered with sbctl"
+
+    log "prepare: install as BOOTX64.EFI on every ESP (GRUB kept as EFI/cmesh/grub-fallback.efi)"
+    local dev mnt n=0
+    for dev in $(esp_devices); do
+        mnt=$(esp_mount "$dev") || die "could not mount ${dev}"
+        mkdir -p "$mnt/EFI/BOOT" "$mnt/EFI/cmesh"
+        if [ -f "$mnt/EFI/BOOT/BOOTX64.EFI" ] && ! signed "$mnt/EFI/BOOT/BOOTX64.EFI" && [ ! -f "$mnt/EFI/cmesh/grub-fallback.efi" ]; then
+            cp -f "$mnt/EFI/BOOT/BOOTX64.EFI" "$mnt/EFI/cmesh/grub-fallback.efi" && sync
+            ok "${dev}: previous loader saved as EFI/cmesh/grub-fallback.efi"
+        fi
+        esp_umount; n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] || die "no ESP with LABEL=${ESP_LABEL}"
+    date -Is > "$P_MARK"
+    /usr/local/sbin/cmesh-esp-sync sync || die "could not mirror the UKI to the ESPs; BOOTX64.EFI unchanged"
+    install -Dm755 /usr/share/cmesh-byol/hardening/initcpio-post-cmesh-esp-sync /etc/initcpio/post/zz-cmesh-esp-sync 2>/dev/null || true
+
+    log "prepare complete"
+    echo
+    echo "Secure Boot is still OFF and the TPM token is untouched. Now:"
+    echo "  1. reboot — the firmware loads the UKI from \\EFI\\BOOT\\BOOTX64.EFI; the TPM unlocks as before"
+    echo "  2. if it does not come back: KVM -> boot EFI/cmesh/grub-fallback.efi from the ESP"
+    echo "  3. when it is back: cmesh-byol-secureboot status, then enroll"
+}
+
+### enroll ##############################################################################
+
+enroll() {
+    preflight
+    [ -f "$P_MARK" ] || die "run prepare first (and reboot once)"
+    keys_exist || die "sbctl keys missing"
+    signed "$UKI" || die "${UKI} is not signed"
+    [ -f "$F_MARK" ] && { ok "already finished"; return 0; }
+    log "enroll: firmware state"
+    if secure_boot_on; then ok "Secure Boot already enabled"; date -Is > "$E_MARK"; systemctl enable cmesh-byol-secureboot-finish.service >/dev/null 2>&1; finish; return; fi
+    setup_mode || die "firmware is not in Setup Mode. Over the OVHcloud KVM: BIOS -> Secure Boot -> clear/delete all keys (custom mode), save, boot back here, re-run enroll."
+    ok "Setup Mode: keys can be enrolled"
+
+    # Check the running image is the one that will be verified: enrolling keys with a
+    # BOOTX64.EFI that is not our signed UKI would make the next boot fail.
+    local dev mnt
+    for dev in $(esp_devices); do
+        mnt=$(esp_mount "$dev" ro) || die "could not mount ${dev}"
+        cmp -s "$mnt/EFI/BOOT/BOOTX64.EFI" "$UKI" || { esp_umount; die "${dev}: BOOTX64.EFI is not the current signed UKI; run prepare again"; }
+        esp_umount
+    done
+    ok "every ESP boots the current signed UKI"
+
+    # Enrolling PK/KEK/db changes PCR 7 immediately; the PCR 7-bound token would fail
+    # at the next boot and the serial console would ask for the passphrase. Re-seal
+    # with no PCR policy for ONE boot; finish binds it to the new PCR 7.
+    log "enroll: temporary PCR-less TPM token (finish replaces it)"
+    for dev in $(luks_devices); do
+        [ "$(pw_slots "$dev")" -ge 1 ] || die "${dev} has no passphrase slot; refusing to touch its TPM token"
+        [ -n "$(tpm_slots "$dev")" ] || die "${dev} has no TPM2 token to unlock with (finalize did not run?)"
+        reseal "$dev" "" \
+            || die "could not re-seal the TPM token on ${dev} without a PCR policy; nothing enrolled"
+        ok "${dev}: TPM token re-sealed with no PCR policy (slot(s) $(tpm_slots "$dev"))"
+    done
+
+    log "enroll: PK, KEK, db (+ Microsoft, + option ROM hashes from the TPM event log)"
+    if sbctl enroll-keys -m -t >"$LOG.enroll" 2>&1 || sbctl enroll-keys -m >>"$LOG.enroll" 2>&1; then
+        ok "keys enrolled: $(sbctl list-enrolled-keys 2>/dev/null | grep -c . ) certificate(s)"
+        rm -f "$LOG.enroll"
+    else
+        cat "$LOG.enroll" >&2
+        alert "sbctl enroll-keys FAILED; TPM token is PCR-less — run finish after fixing, or re-seal to PCR 7 by hand"
+        die "sbctl enroll-keys failed (log above). The TPM token is now PCR-less: fix and re-run, or run 'cmesh-byol-secureboot finish' to re-bind."
+    fi
+    date -Is > "$E_MARK"
+    systemctl enable cmesh-byol-secureboot-finish.service >/dev/null 2>&1 && ok "finish unit enabled for the next boot"
+    log "enroll complete"
+    echo
+    echo "Now reboot. The firmware comes up with Secure Boot ON and verifies BOOTX64.EFI with your key."
+    echo "cmesh-byol-secureboot-finish.service then binds the TPM to PCR 7. Check: cmesh-byol-secureboot status"
+    echo "If the boot fails: KVM -> BIOS -> disable Secure Boot; the PCR-less token lets it boot; then investigate."
+}
+
+### finish ##############################################################################
+
+finish() {
+    [ "$(id -u)" -eq 0 ] || die "must run as root"
+    [ -f "$E_MARK" ] || die "run enroll first"
+    [ -f "$F_MARK" ] && { ok "already finished at $(cat "$F_MARK")"; return 0; }
+    log "finish: verify the boot we are in"
+    if ! secure_boot_on; then
+        alert "Secure Boot is NOT enforcing on this boot; the LUKS TPM token is still PCR-less. Enable Secure Boot in the firmware; finish retries at next boot."
+        die "Secure Boot is off; not binding the TPM to it"
+    fi
+    ok "Secure Boot: enforcing"
+    [ -f "$UKI" ] && signed "$UKI" || die "${UKI} missing or unsigned"
+    # The firmware verified BOOTX64.EFI against db; confirm it is our image, not a
+    # fallback someone selected over the KVM.
+    local dev mnt
+    for dev in $(esp_devices); do
+        mnt=$(esp_mount "$dev" ro) || die "could not mount ${dev}"
+        cmp -s "$mnt/EFI/BOOT/BOOTX64.EFI" "$UKI" || { esp_umount; die "${dev}: BOOTX64.EFI is not the current UKI"; }
+        esp_umount
+    done
+    ok "every ESP boots the current signed UKI"
+    grep -q 'cmesh-linux.efi\|BOOTX64.EFI' /sys/firmware/efi/efivars/LoaderImageIdentifier-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f 2>/dev/null \
+        && ok "systemd-stub reports it loaded this image" || warn "could not confirm the loader identifier (not fatal)"
+
+    log "finish: bind the TPM token to PCR ${PCRS}"
+    for dev in $(luks_devices); do
+        [ "$(pw_slots "$dev")" -ge 1 ] || die "${dev} has no passphrase slot; refusing"
+        reseal "$dev" "$PCRS" \
+            || { alert "could not re-seal ${dev} to PCR ${PCRS}; token may still be PCR-less"; die "cryptenroll failed on ${dev}"; }
+        ok "${dev}: TPM token sealed to PCR ${PCRS} (slot(s) $(tpm_slots "$dev"))"
+    done
+    date -Is > "$F_MARK"
+    systemctl disable cmesh-byol-secureboot-finish.service >/dev/null 2>&1 || true
+    alert "Secure Boot enforcing; LUKS TPM token bound to PCR ${PCRS}; UKI signed with the host key"
+    log "finish complete: Secure Boot on, TPM bound to it, passphrase remains the rescue path"
+}
+
+case "${1:-}" in
+    status)  status ;;
+    prepare) mkdir -p "$(dirname "$LOG")"; exec > >(tee -a "$LOG") 2>&1; prepare ;;
+    enroll)  mkdir -p "$(dirname "$LOG")"; exec > >(tee -a "$LOG") 2>&1; enroll ;;
+    finish)  mkdir -p "$(dirname "$LOG")"; exec > >(tee -a "$LOG") 2>&1; finish ;;
+    *) echo "usage: cmesh-byol-secureboot status | prepare | enroll | finish" >&2; exit 64 ;;
+esac

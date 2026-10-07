@@ -468,10 +468,9 @@ every control without changing anything.
 
 ### What the script cannot do for you
 
-- **Secure Boot.** The TPM seal is bound to PCR 7 only. With Secure Boot off, PCR 7 is
-  the same for any OS booted on the machine, so the encryption protects a pulled drive
-  but not the box itself. Check `bootctl status`; the fix is your own Secure Boot keys
-  (sbctl), a signed unified kernel image, and binding to PCRs 7+11.
+- **Secure Boot** is a separate, three-step procedure with two reboots: see the next
+  section. Until it is done the TPM seal (PCR 7) is the same for any OS booted on the
+  machine, so the encryption protects a pulled drive but not the box itself.
 - **Logs off the box.** Local retention is bounded by the 8 GiB root. Ship the journal
   (`systemd-journal-upload`, or any collector) to storage you control, with the
   retention your policy names. The audit log is the record an auditor asks for.
@@ -480,22 +479,71 @@ every control without changing anything.
 - **Backups**, a Business Associate Agreement with the provider, the risk analysis, and
   access reviews — paperwork, not packages.
 
+## Secure Boot: closing the boot chain
+
+`cmesh-byol-secureboot` (installed by the hardening) turns the host into one that boots
+only a kernel signed with a key that lives on its own encrypted root, and binds the TPM
+unlock to that state. It replaces GRUB with a **unified kernel image** (systemd-stub +
+kernel + initramfs + command line, one signed PE) at `\EFI\BOOT\BOOTX64.EFI`, the path
+OVHcloud's `efiBootloaderPath` already names. GRUB under Secure Boot without shim does
+not verify what it loads, so a signed GRUB with an editable grub.cfg would be a signed
+door with no lock.
+
+Three steps, two reboots, each checkable with `cmesh-byol-secureboot status`:
+
+```bash
+sudo cmesh-byol-secureboot prepare   # keys, signed UKI on every ESP, GRUB kept as EFI/cmesh/grub-fallback.efi
+sudo reboot                          # Secure Boot still off: proves the UKI boots on this hardware
+sudo cmesh-byol-secureboot status
+
+# BIOS over the OVHcloud KVM: Secure Boot -> clear / delete all keys (custom mode) -> save.
+# Clearing the keys changes PCR 7 by itself: the next boot asks for the passphrase once.
+sudo cmesh-byol-secureboot enroll    # needs Setup Mode; asks the passphrase if the old TPM token no longer unseals,
+                                     # seals a PCR-less token for one boot, enrols PK/KEK/db + Microsoft
+sudo reboot                          # Secure Boot on; cmesh-byol-secureboot-finish.service binds the TPM to PCR 7
+sudo cmesh-byol-secureboot status    # finished=<date>, every ESP "current UKI (signed)", tpm2 slot on both disks
+```
+
+Kernel updates keep working unattended: mkinitcpio rebuilds the UKI, sbctl's post hook
+signs it, and `cmesh-esp-sync` refuses an unsigned image and mirrors a signed one to
+both ESPs. The private key is at `/var/lib/sbctl/keys` on the encrypted root.
+
+What changes operationally:
+
+- **OVHcloud rescue mode and a re-deploy boot unsigned images and will fail** while
+  Secure Boot is on. Disable it from the BIOS over the KVM first. The KVM is now the
+  recovery path; make sure you can reach it.
+- If the UKI does not boot after `prepare`, pick `EFI/cmesh/grub-fallback.efi` from the
+  firmware boot menu over the KVM. Nothing has been enrolled yet.
+- If the box does not come back after `enroll`, disable Secure Boot in the BIOS: the
+  PCR-less token still unlocks the disks, and `finish` waits for the next boot.
+- PCR 7 alone does not stop a rollback to an older image signed with the same key.
+  Binding PCR 11 through signed policies (`systemd-measure`) closes that and is not done
+  here.
+
 ## Backing up the LUKS headers
 
 Losing a header loses that disk, even with the passphrase and intact data. There are two
 independent headers here (that is the point of LUKS-under-RAID), but neither is
 recoverable from the other.
 
-`cryptsetup luksHeaderBackup` is **LUKS1-only**. For LUKS2 there is no supported
-equivalent, so copy the header and keyslot area directly. Measured: the keyslot area is
-`16744448` bytes at offset `32768`, payload at `16777216` (16 MiB), and that size is
-fixed — it does not scale with the device, so 32 MiB covers it:
+`cryptsetup luksHeaderBackup` works for LUKS2 as well as LUKS1 and stores the header plus
+the whole keyslot area (16 MiB here). Run it as the admin user so the files land where
+that account can copy them off; root's SSH login is closed:
 
 ```bash
-for p in $(blkid -o device -t TYPE=crypto_LUKS); do
-    dd if="$p" of="/root/luks-header-$(basename "$p").img" bs=1M count=32
+for d in $(sudo blkid -o device -t TYPE=crypto_LUKS); do
+    sudo cryptsetup luksHeaderBackup "$d" --header-backup-file ~/luks-header-$(basename "$d").img
 done
+sudo chown "$USER" ~/luks-header-*.img && chmod 600 ~/luks-header-*.img
+cryptsetup luksDump ~/luks-header-nvme0n1p4.img | grep -A3 '^Keyslots'   # sanity: the slots are in it
 ```
+
+Then from your workstation `scp admin@HOST:'luks-header-*.img' <offline storage>` and
+`shred -u ~/luks-header-*.img` on the server. Redo it whenever the keyslots change: a
+passphrase change, a TPM re-enrolment, a Secure Boot enrolment (which re-seals the TPM
+slot). The TPM slot in the backup is bound to this machine's TPM; the passphrase slot is
+the one a restore depends on.
 
 Store them off-host; a header plus the passphrase decrypts everything. Test the restore
 on a scratch device before you need it.

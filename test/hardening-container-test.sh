@@ -135,7 +135,30 @@ printf '\0' >> /usr/bin/nft
 check "pacman warning names the file" yes "$(grep -q 'package: .*/usr/bin/nft' /tmp/int4.out && echo yes || echo no)"
 
 echo
-echo "(6) --status runs without root-only state"
+echo "(6) Secure Boot pipeline: mkinitcpio builds a UKI, sbctl's post hook signs it, cmesh-esp-sync sees the signature"
+pacman -S --noconfirm --needed linux >/dev/null 2>&1 || echo "  (linux install failed)"
+kver=$(ls /usr/lib/modules | head -1)
+printf 'root=UUID=0000-test rw console=ttyS1,115200n8 lsm=landlock,lockdown,yama,integrity,apparmor,bpf audit=1\n' > /etc/kernel/cmdline
+mkdir -p /boot/efi/EFI/Linux
+sed -i -E 's|^#?default_uki=.*|default_uki="/boot/efi/EFI/Linux/cmesh-linux.efi"|' /etc/mkinitcpio.d/linux.preset
+grep -q '^default_uki="/boot/efi/EFI/Linux/cmesh-linux.efi"$' /etc/mkinitcpio.d/linux.preset || echo 'default_uki="/boot/efi/EFI/Linux/cmesh-linux.efi"' >> /etc/mkinitcpio.d/linux.preset
+sbctl create-keys >/dev/null 2>&1; check "sbctl create-keys" 0 $?
+mkinitcpio -P >/tmp/mk.out 2>&1; rc=$?
+check "mkinitcpio -P with default_uki" 0 "$rc"; [ "$rc" -ne 0 ] && tail -20 /tmp/mk.out
+check "UKI produced" yes "$([ -s /boot/efi/EFI/Linux/cmesh-linux.efi ] && echo yes || echo no)"
+check "UKI larger than the kernel" yes "$([ "$(stat -c %s /boot/efi/EFI/Linux/cmesh-linux.efi 2>/dev/null || echo 0)" -gt "$(stat -c %s /boot/vmlinuz-linux)" ] && echo yes || echo no)"
+check "sbctl's post hook signed it during mkinitcpio" yes "$(grep -q 'Signing /boot/efi/EFI/Linux/cmesh-linux.efi' /tmp/mk.out && echo yes || echo no)"
+/usr/local/sbin/cmesh-esp-sync check /boot/efi/EFI/Linux/cmesh-linux.efi; check "cmesh-esp-sync check: signed" 0 $?
+/usr/local/sbin/cmesh-esp-sync check /boot/vmlinuz-linux; check "cmesh-esp-sync check: the raw kernel is an unsigned PE (1)" 1 $?
+check "our post hook ran after sbctl's (order in /etc + /usr/lib)" yes "$(grep -q 'cmesh-esp-sync: not prepared for Secure Boot' /tmp/mk.out && echo yes || echo no)"
+check "cmdline embedded in the UKI" yes "$(grep -aq 'console=ttyS1,115200n8 lsm=' /boot/efi/EFI/Linux/cmesh-linux.efi && echo yes || echo no)"
+/usr/local/sbin/cmesh-byol-secureboot status >/tmp/sb.out 2>&1; check "secureboot status runs (no UEFI here)" 0 $?
+check "status reports NOT UEFI" yes "$(grep -q 'NOT UEFI' /tmp/sb.out && echo yes || echo no)"
+/usr/local/sbin/cmesh-byol-secureboot prepare >/tmp/sbp.out 2>&1; check "prepare refuses without UEFI (exit 1)" 1 $?
+check "prepare said why" yes "$(grep -q 'not booted via UEFI' /tmp/sbp.out && echo yes || echo no)"
+
+echo
+echo "(7) --status runs without root-only state"
 /usr/local/sbin/cmesh-byol-harden --status >/tmp/status.out 2>&1; check "--status exit 0" 0 $?
 check "--status lists units" yes "$(grep -q 'nftables.service' /tmp/status.out && echo yes || echo no)"
 

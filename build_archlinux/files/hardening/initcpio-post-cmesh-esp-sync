@@ -1,0 +1,5 @@
+#!/usr/bin/bash
+# /etc/initcpio/post/zz-cmesh-esp-sync — runs after every mkinitcpio image build, after
+# sbctl's post hook has signed the UKI. Arguments: <kernel> <initramfs> <uki>.
+[ -n "${3:-}" ] || exit 0
+exec /usr/local/sbin/cmesh-esp-sync sync

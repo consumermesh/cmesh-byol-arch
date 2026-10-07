@@ -1,0 +1,18 @@
+[Unit]
+Description=cmesh: bind the TPM to the Secure Boot state after key enrolment
+# Enabled by `cmesh-byol-secureboot enroll`. On the first boot with Secure Boot on it
+# re-seals the LUKS TPM token to PCR 7 and removes the temporary PCR-less token. If
+# Secure Boot is still off it alerts and leaves itself enabled for the next boot.
+ConditionPathExists=/var/lib/cmesh-byol/secureboot-enrolled
+ConditionPathExists=!/var/lib/cmesh-byol/secureboot-finished
+After=cmesh-byol-finalize.service systemd-cryptsetup.target local-fs.target
+DefaultDependencies=no
+After=sysinit.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cmesh-byol-secureboot finish
+
+[Install]
+WantedBy=multi-user.target

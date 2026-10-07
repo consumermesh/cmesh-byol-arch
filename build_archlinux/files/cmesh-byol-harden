@@ -49,18 +49,19 @@ warn() { printf '  WARN  %s\n' "$*" >&2; WARNINGS=$((WARNINGS + 1)); }
 die()  { printf '\nFATAL: %s\n' "$*" >&2; exit 1; }
 live() { [ "$BUILD" -eq 0 ]; }
 
-PKGS=(nftables audit sshguard smartmontools arch-audit sudo apparmor openssh mdadm)
+PKGS=(nftables audit sshguard smartmontools arch-audit sudo apparmor openssh mdadm sbctl)
 # mdmonitor.service is not here: it has no [Install] section and is pulled in by the
 # md-raid udev rule whenever an array exists; the override above gives it --syslog.
 UNITS=(nftables.service auditd.service sshguard.service smartd.service
        apparmor.service systemd-timesyncd.service
-       cmesh-arch-audit.timer cmesh-integrity.timer cmesh-integrity-init.service)
+       cmesh-arch-audit.timer cmesh-integrity.timer cmesh-integrity-init.service
+       cmesh-byol-secureboot-finish.service)
 
 ### --status: read-only report ########################################################
 
 status() {
     local u
-    echo "cmesh-byol-harden status on $(hostname) ($(date -Is))"
+    echo "cmesh-byol-harden status on $(uname -n) ($(date -Is))"
     echo
     echo "units:"
     for u in "${UNITS[@]}" mdmonitor.service; do
@@ -165,6 +166,11 @@ put cmesh-integrity-init.service  /etc/systemd/system/cmesh-integrity-init.servi
 put cmesh-arch-audit.service      /etc/systemd/system/cmesh-arch-audit.service 0644
 put cmesh-arch-audit.timer        /etc/systemd/system/cmesh-arch-audit.timer   0644
 put pacman-cmesh-integrity.hook   /etc/pacman.d/hooks/90-cmesh-integrity.hook  0644
+put cmesh-byol-secureboot         /usr/local/sbin/cmesh-byol-secureboot        0755
+put cmesh-esp-sync                /usr/local/sbin/cmesh-esp-sync               0755
+put initcpio-post-cmesh-esp-sync  /etc/initcpio/post/zz-cmesh-esp-sync         0755
+put pacman-cmesh-esp-sync.hook    /etc/pacman.d/hooks/zzz-cmesh-esp-sync.hook  0644
+put cmesh-byol-secureboot-finish.service /etc/systemd/system/cmesh-byol-secureboot-finish.service 0644
 
 # The sudo I/O log directory and the alert log must not be world-readable.
 install -d -m 0700 /var/log/sudo-io
@@ -355,5 +361,6 @@ if live; then
     echo "  * restrict SSH sources in /etc/nftables.conf (ssh_allowed_v4), then: nft -c -f /etc/nftables.conf && nft -f /etc/nftables.conf"
     echo "  * journalctl --setup-keys  (store the verification key off the box)"
     echo "  * reboot to activate AppArmor and audit=1; then: cmesh-byol-harden --status"
+    echo "  * close the boot chain: cmesh-byol-secureboot status, then prepare / enroll / finish (see README)"
 fi
 [ "$WARNINGS" -eq 0 ]
