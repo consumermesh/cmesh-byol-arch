@@ -146,16 +146,38 @@ defmodule OvhStatus do
   # with the running step marked, rather than flattening it to a status word.
   @step_icon %{"done" => "ok  ", "doing" => ">>> ", "todo" => "    ", "error" => "ERR "}
 
-  def steps(status) when is_list(status), do: status
+  # The endpoint returns an ENVELOPE around the step list:
+  #
+  #   %{"elapsedTime" => 74, "progress" => [%{"comment" => ..., "status" => ...}, ...]}
+  #
+  # but it has also been observed returning the bare list. Accept both, and treat an empty
+  # list as absent so the caller falls through to the unrecognised branch rather than
+  # rendering nothing.
+  def steps(%{"progress" => list}) when is_list(list) and list != [], do: list
+  def steps(list) when is_list(list) and list != [], do: list
   def steps(_), do: []
 
-  def render(status, elapsed) when is_list(status) do
+  def render(status, elapsed) do
+    case steps(status) do
+      [] -> render_unknown(status, elapsed)
+      list -> render_steps(list, elapsed, api_elapsed(status))
+    end
+  end
+
+  # The API's own elapsedTime is authoritative when present -- it is the deploy's clock,
+  # not ours, and it survives the script being restarted mid-deploy.
+  defp api_elapsed(%{"elapsedTime" => t}) when is_integer(t), do: t
+  defp api_elapsed(_), do: nil
+
+  defp render_steps(status, elapsed, api_elapsed) do
     total = length(status)
     done = Enum.count(status, &(&1["status"] == "done"))
     errors = Enum.filter(status, &(&1["status"] == "error"))
     doing = Enum.find(status, &(&1["status"] == "doing"))
 
-    IO.puts("\n=== #{done}/#{total} steps done   (#{elapsed}s) ===")
+    shown = api_elapsed || elapsed
+
+    IO.puts("\n=== #{done}/#{total} steps done   (#{shown}s#{if api_elapsed, do: " per API"}) ===")
 
     if doing do
       IO.puts("running: #{doing["comment"]}")
@@ -178,28 +200,28 @@ defmodule OvhStatus do
     :ok
   end
 
-  # Tolerate a flat map too, so an API change degrades to "unrecognised" rather than a crash
-  # in the middle of a deploy.
-  def render(other, elapsed) when is_map(other) do
+  # An unrecognised shape is printed rather than swallowed: a renderer that crashes
+  # mid-deploy is worse than one that shows raw JSON, and this function exists precisely
+  # because the shape was guessed wrong twice.
+  defp render_unknown(other, elapsed) do
     IO.puts("\n=== unrecognised status shape (#{elapsed}s) ===")
-    IO.puts(inspect(other, pretty: true))
-    :ok
-  end
-
-  def render(other, elapsed) do
-    IO.puts("\n=== unrecognised status (#{elapsed}s): #{inspect(other)} ===")
+    IO.puts(inspect(other, pretty: true, limit: :infinity))
     :ok
   end
 
   # Terminal when every step is done, or any step has failed. The deploy is over either
   # way -- and that is the moment the machine reboots and the FIRST BOOT installer starts,
   # which is the part no API can report.
-  def terminal?(status) when is_list(status) and status != [] do
-    Enum.any?(status, &(&1["status"] in ["error", "failed", "cancelled"])) or
-      Enum.all?(status, &(&1["status"] == "done"))
-  end
+  def terminal?(status) do
+    case steps(status) do
+      [] ->
+        false
 
-  def terminal?(_), do: false
+      list ->
+        Enum.any?(list, &(&1["status"] in ["error", "failed", "cancelled"])) or
+          Enum.all?(list, &(&1["status"] == "done"))
+    end
+  end
 end
 
 creds = OvhStatus.credentials!()

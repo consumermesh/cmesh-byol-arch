@@ -81,7 +81,20 @@ real = [
 
 st = %{pass: 0, fail: 0}
 
-IO.puts("=== render/2 on the real step list ===")
+IO.puts("=== steps/1 accepts every shape the endpoint has returned ===")
+st = Checker.check(st, "envelope %{progress: [...]} unwraps", length(real), length(OvhStatus.steps(%{"elapsedTime" => 74, "progress" => real})))
+st = Checker.check(st, "bare list passes through", length(real), length(OvhStatus.steps(real)))
+st = Checker.check(st, "flat map -> empty (unrecognised)", [], OvhStatus.steps(%{"status" => "doing"}))
+st = Checker.check(st, "nil -> empty", [], OvhStatus.steps(nil))
+st = Checker.check(st, "empty progress -> empty", [], OvhStatus.steps(%{"progress" => []}))
+
+IO.puts("\n=== render/2 on the envelope (what the API actually sends) ===")
+out_env = capture.(fn -> OvhStatus.render(%{"elapsedTime" => 74, "progress" => real}, 999) end)
+st = Checker.check(st, "shows the API's own elapsedTime", true, String.contains?(out_env, "74s"))
+st = Checker.check(st, "does not show the local elapsed when the API supplies one", false, String.contains?(out_env, "999s"))
+st = Checker.check(st, "counts done steps", true, String.contains?(out_env, "2/17"))
+
+IO.puts("\n=== render/2 on the real step list ===")
 out = capture.(fn -> OvhStatus.render(real, 137) end)
 st = Checker.check(st, "counts done steps", true, String.contains?(out, "2/17"))
 st = Checker.check(st, "shows elapsed time", true, String.contains?(out, "137s"))
@@ -104,6 +117,8 @@ st = Checker.check(st, "names the step that failed", true, String.contains?(out2
 
 IO.puts("\n=== terminal?/1 decides when --watch stops ===")
 st = Checker.check(st, "mid-deploy -> keep polling", false, OvhStatus.terminal?(real))
+st = Checker.check(st, "envelope mid-deploy -> keep polling", false, OvhStatus.terminal?(%{"elapsedTime" => 74, "progress" => real}))
+st = Checker.check(st, "envelope with a failure -> stop", true, OvhStatus.terminal?(%{"progress" => failed}))
 st = Checker.check(st, "a failed step -> stop", true, OvhStatus.terminal?(failed))
 st = Checker.check(st, "all done -> stop", true, OvhStatus.terminal?(Enum.map(real, &%{&1 | "status" => "done"})))
 st = Checker.check(st, "empty list -> keep polling", false, OvhStatus.terminal?([]))
