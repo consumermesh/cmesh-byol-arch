@@ -1,0 +1,55 @@
+#!/bin/bash
+# luks-header-shrink — make a LUKS2 header backup small enough for a password manager.
+#
+#   scripts/luks-header-shrink <backup.img> [<out.img.xz>]
+#
+# `cryptsetup luksHeaderBackup` writes the whole 16 MiB header + keyslot area, and the
+# unused keyslot space is random bytes (wiped slots), so it does not compress: two
+# headers came out at 33 MB in a .tar.xz against a 5 MB attachment limit.
+#
+# Everything a restore needs lives in a few regions: the two binary+JSON header copies
+# at the start and the area of each keyslot that is actually in use. This copies only
+# those regions into a zero-filled image of the same size and xz-compresses it: about
+# 0.5 MB per disk. `cryptsetup luksHeaderRestore` accepts the result unchanged, because
+# the zeroed space was never referenced by the header's JSON.
+#
+# Needs cryptsetup (in the p1 distrobox: `distrobox enter p1 -- scripts/luks-header-shrink ...`).
+# Verifies that the JSON metadata of the output matches the input before it reports.
+set -euo pipefail
+in="${1:?usage: luks-header-shrink <backup.img> [<out.img.xz>]}"
+out="${2:-${in%.img}.small.img.xz}"
+command -v cryptsetup >/dev/null || { echo "cryptsetup not found; run inside the p1 distrobox" >&2; exit 1; }
+command -v xz >/dev/null || { echo "xz not found" >&2; exit 1; }
+
+json=$(cryptsetup luksDump --dump-json-metadata "$in" | tr -d ' \n\t')
+[ -n "$json" ] || { echo "$in: not a LUKS2 header (luksDump produced nothing)" >&2; exit 1; }
+json_size=$(printf '%s' "$json" | grep -oE '"json_size":"[0-9]+"' | grep -oE '[0-9]+')
+hdr=$((4096 + json_size))                         # one header copy: 4 KiB binary + JSON area
+size=$(stat -c %s "$in")
+
+tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+truncate -s "$size" "$tmp"
+dd if="$in" of="$tmp" bs=4096 count=$((2 * hdr / 4096)) conv=notrunc status=none
+kept=$((2 * hdr))
+n=0
+# Each in-use keyslot: "area":{"type":"raw","offset":"N","size":"N",...}
+while read -r area; do
+    off=$(printf '%s' "$area" | grep -oE '"offset":"[0-9]+"' | grep -oE '[0-9]+')
+    len=$(printf '%s' "$area" | grep -oE '"size":"[0-9]+"' | grep -oE '[0-9]+')
+    [ -n "$off" ] && [ -n "$len" ] || { echo "could not parse a keyslot area: $area" >&2; exit 1; }
+    [ $((off % 4096)) -eq 0 ] && [ $((len % 4096)) -eq 0 ] || { echo "keyslot area not 4 KiB aligned: $area" >&2; exit 1; }
+    dd if="$in" of="$tmp" bs=4096 skip=$((off / 4096)) seek=$((off / 4096)) count=$((len / 4096)) conv=notrunc status=none
+    kept=$((kept + len)); n=$((n + 1))
+done < <(printf '%s' "$json" | grep -oE '"area":\{[^}]*\}')
+[ "$n" -gt 0 ] || { echo "no keyslots found in $in; refusing" >&2; exit 1; }
+
+xz -9 -c "$tmp" > "$out"
+
+# The output must describe exactly the same header.
+check=$(mktemp); trap 'rm -f "$tmp" "$check"' EXIT
+xz -dc "$out" > "$check"
+[ "$(cryptsetup luksDump --dump-json-metadata "$check" | tr -d ' \n\t')" = "$json" ] \
+    || { rm -f "$out"; echo "metadata mismatch after shrinking; output removed" >&2; exit 1; }
+printf '%s: %d keyslot(s), kept %d of %d bytes -> %s (%d bytes)\n' \
+    "$in" "$n" "$kept" "$size" "$out" "$(stat -c %s "$out")"
+printf 'restore: xz -dc %s > h.img && cryptsetup luksHeaderRestore <device> --header-backup-file h.img\n' "$(basename "$out")"

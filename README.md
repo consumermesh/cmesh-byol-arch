@@ -540,7 +540,30 @@ cryptsetup luksDump ~/luks-header-nvme0n1p4.img | grep -A3 '^Keyslots'   # sanit
 ```
 
 Then from your workstation `scp admin@HOST:'luks-header-*.img' <offline storage>` and
-`shred -u ~/luks-header-*.img` on the server. Redo it whenever the keyslots change: a
+`shred -u ~/luks-header-*.img` on the server. The files are 16 MiB each and do not
+compress (wiped keyslot space is random bytes); for a password manager with an attachment
+limit, `scripts/luks-header-shrink` keeps only the header copies and the keyslots in use
+and produces about 0.5 MB per disk, which `luksHeaderRestore` accepts as is:
+
+```bash
+distrobox enter p1 -- scripts/luks-header-shrink luks-header-nvme0n1p4.img   # -> luks-header-nvme0n1p4.small.img.xz
+```
+
+Prove a backup unlocks before trusting it (any Linux with cryptsetup; the TPM token is
+skipped, the passphrase is what is tested):
+
+```bash
+distrobox enter p1
+xz -dc luks-header-nvme0n1p4.small.img.xz > /tmp/h.img
+truncate -s 64M /tmp/dummy        # stands in for the data device; cryptsetup loop-mounts it itself
+sudo cryptsetup open --test-passphrase --disable-external-tokens --header /tmp/h.img /tmp/dummy
+rm -f /tmp/h.img /tmp/dummy
+```
+
+Silence and exit 0 means the passphrase opened a keyslot. "No key available with this
+passphrase" (exit 2) means the backup is fine but the passphrase is not the one in it.
+Anything else is a problem with the file. (Manual `losetup` is not permitted inside the
+distrobox; the file form above needs none.) Redo it whenever the keyslots change: a
 passphrase change, a TPM re-enrolment, a Secure Boot enrolment (which re-seals the TPM
 slot). The TPM slot in the backup is bound to this machine's TPM; the passphrase slot is
 the one a restore depends on.

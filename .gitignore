@@ -37,3 +37,8 @@ deploy.env~
 # Emacs autosave and lock files; #deploy.json# would carry the passphrase and SSH key
 \#*\#
 .#*
+
+# LUKS header backups downloaded from the server. A header plus the passphrase decrypts
+# the whole disk; they must never be committed, and they do not belong in a repo at all.
+luks-header-*.img
+*.luks-header

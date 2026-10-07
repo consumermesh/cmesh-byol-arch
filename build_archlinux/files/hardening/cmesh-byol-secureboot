@@ -114,11 +114,26 @@ tpm_slots() { systemd-cryptenroll "$1" 2>/dev/null | awk '$2 == "tpm2" {print $1
 reseal() { # reseal <dev> <pcrs>
     local dev="$1" pcrs="$2"
     if systemd-cryptenroll --unlock-tpm2-device=auto --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs="$pcrs" "$dev" >/dev/null 2>&1; then
-        return 0
+        prune_stale_tokens "$dev"; return 0
     fi
     [ -t 0 ] || { warn "${dev}: the current TPM token does not unseal (PCR 7 changed) and there is no terminal for the passphrase"; return 1; }
     warn "${dev}: the current TPM token does not unseal (PCR 7 changed since it was sealed); enter the LUKS passphrase"
-    systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs="$pcrs" "$dev"
+    systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs="$pcrs" "$dev" || return 1
+    prune_stale_tokens "$dev"
+}
+
+# Seen on the server after enroll + finish: --wipe-slot=tpm2 removed the old keyslot but
+# left its token behind, bound to no keyslot and carrying the old PCR policy. Harmless,
+# but it is one failed TPM attempt per boot and a confusing header. Remove every
+# systemd-tpm2 token whose keyslot list is empty.
+prune_stale_tokens() { # prune_stale_tokens <dev>
+    local dev="$1" id
+    for id in $(cryptsetup luksDump "$dev" 2>/dev/null | awk '/^Tokens:/{t=1; next} /^[A-Z]/{t=0} t && /^[[:space:]]+[0-9]+: systemd-tpm2$/ {sub(":", "", $1); print $1}'); do
+        if cryptsetup token export --token-id "$id" "$dev" 2>/dev/null | grep -q '"keyslots":[[:space:]]*\[[[:space:]]*\]'; then
+            cryptsetup token remove --token-id "$id" "$dev" && ok "${dev}: removed stale TPM token ${id} (bound to no keyslot)" \
+                || warn "${dev}: could not remove stale token ${id}"
+        fi
+    done
 }
 pw_slots()  { systemd-cryptenroll "$1" 2>/dev/null | awk '$2 == "password" {print $1}' | wc -l; }
 
