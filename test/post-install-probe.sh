@@ -23,6 +23,27 @@ set -u
 
 hdr() { printf '\n===== %s =====\n' "$*"; }
 
+# List an Arch initramfs from a rescue that has no lsinitcpio. The image is an
+# uncompressed early cpio (microcode) followed by a zstd-compressed cpio, so a plain
+# `zstd -dc` of the whole file fails: find the zstd magic and start there.
+list_initramfs() { # list_initramfs <image> -> file list on stdout, empty if nothing worked
+    local img="$1" off
+    if command -v lsinitcpio >/dev/null 2>&1; then
+        lsinitcpio "$img" 2>/dev/null && return 0
+    fi
+    if command -v lsinitrd >/dev/null 2>&1; then
+        lsinitrd "$img" 2>/dev/null && return 0
+    fi
+    if command -v zstd >/dev/null 2>&1; then
+        off=$(LC_ALL=C grep -obUaP '\x28\xb5\x2f\xfd' "$img" 2>/dev/null | head -1 | cut -d: -f1)
+        if [ -n "$off" ]; then
+            tail -c +"$((off + 1))" "$img" | zstd -dc 2>/dev/null | cpio -t 2>/dev/null && return 0
+        fi
+    fi
+    # Last resort: raw strings. Good enough for "is mdadm in there at all".
+    grep -aoE '[A-Za-z0-9_./-]*(mdadm|md-raid|raid1\.ko|nvme\.ko|simpledrm\.ko|crypttab|cmesh-luks\.key|systemd-cryptsetup)[A-Za-z0-9_./-]*' "$img" 2>/dev/null | sort -u
+}
+
 hdr "0. tools present in rescue?"
 for t in cryptsetup mdadm blkid lsblk findmnt; do
     printf '  %-12s %s\n' "$t" "$(command -v "$t" 2>/dev/null || echo MISSING)"
@@ -39,6 +60,15 @@ blkid 2>&1 | sed 's/^/  /'
 hdr "3. assembling the unencrypted arrays"
 mdadm --assemble --scan 2>&1 || true
 cat /proc/mdstat 2>&1
+# The superblock NAME and homehost decide which /dev/mdN an array gets on a system that
+# has no matching mdadm.conf. If these say "rescue:2" and the bootstrap fstab says
+# /dev/md2, the two only line up when the bootstrap's mdadm.conf pins them.
+echo "  --- superblocks (name= is what the initramfs sees) ---"
+mdadm --examine --scan 2>&1 | sed 's/^/      /'
+for md in /dev/md[0-9]* /dev/md/*; do
+    [ -b "$md" ] || continue
+    printf '      %-14s %s\n' "$(readlink -f "$md")" "$(mdadm --detail "$md" 2>/dev/null | grep -E '^\s*(Name|Raid Level|State) :' | tr -s ' ' | tr '\n' ';')"
+done
 
 # ---------------------------------------------------------------------------
 # Find things by signature, not by partition number.
@@ -118,8 +148,33 @@ show_root() { # show_root <device> <title>
     else
         echo "      ABSENT (the installer never started here, or this is not where it logs)"
     fi
-    echo "  --- deploy hook log present? ---"
-    ls -la "$M/var/log/ovh-make-bootable.log" 2>&1 | sed 's/^/      /'
+    # The deploy hook's log is the only record of what the deployer's chroot looked like:
+    # whether mdadm --detail --scan saw the arrays, what MODULES/HOOKS the initramfs was
+    # rebuilt with, and what grub-mkconfig produced. It is written to the BOOTSTRAP root.
+    echo "  --- deploy hook log (/var/log/ovh-make-bootable.log) ---"
+    if [ -f "$M/var/log/ovh-make-bootable.log" ]; then
+        sed 's/^/      /' "$M/var/log/ovh-make-bootable.log"
+    else
+        echo "      ABSENT"
+    fi
+    echo "  --- mkinitcpio.conf (MODULES / HOOKS) ---"
+    grep -E '^(MODULES|HOOKS|FILES)=' "$M/etc/mkinitcpio.conf" 2>&1 | sed 's/^/      /'
+    # Did the kernel ever reach userspace on this hardware? A persistent journal records
+    # every boot, including one that died waiting for the root device inside the initrd.
+    echo "  --- journal boots recorded on this root ---"
+    if [ -d "$M/var/log/journal" ] && command -v journalctl >/dev/null 2>&1; then
+        journalctl -D "$M/var/log/journal" --list-boots --no-pager 2>&1 | sed 's/^/      /'
+        echo "  --- last boot: initrd / root-device / emergency messages ---"
+        journalctl -D "$M/var/log/journal" -b -0 --no-pager -o short-monotonic 2>/dev/null \
+            | grep -v 'audit' \
+            | grep -iE 'initrd|md[0-9]|md/|mdadm|raid|nvme[0-9]|root=|sysroot|Timed out|emergency|Failed|cmesh|cloud-init|networkd|DHCP|sshd' \
+            | tail -60 | sed 's/^/      /'
+        echo "  --- last boot: the installer unit's own output ---"
+        journalctl -D "$M/var/log/journal" -b -0 --no-pager -u cmesh-byol-install.service 2>/dev/null \
+            | tail -30 | sed 's/^/      /'
+    else
+        echo "      no /var/log/journal here (or no journalctl in this rescue)"
+    fi
     echo "  --- installer unit enabled here? ---"
     ls -la "$M/etc/systemd/system/multi-user.target.wants/" 2>&1 | grep -i cmesh | sed 's/^/      /' || echo "      (no cmesh unit enabled)"
     echo "  --- sshd enabled? ---"
@@ -150,17 +205,32 @@ if [ -n "$BOOT_DEV" ]; then
     B=$(mktemp -d)
     if mount -o ro "$BOOT_DEV" "$B" 2>/dev/null; then
         ls -la "$B" 2>&1 | sed 's/^/      /'
-        echo "  --- grub.cfg root= ---"
-        grep -o 'root=[^ ]*' "$B/grub/grub.cfg" 2>/dev/null | sort -u | sed 's/^/      /'
-        echo "  --- does the initramfs carry the crypttab and keyfile? ---"
+        echo "  --- grub.cfg: every kernel and initrd line ---"
+        grep -nE '^\s*(linux|initrd|set root|search)' "$B/grub/grub.cfg" 2>/dev/null | sed 's/^/      /'
+        echo "  --- what the initramfs actually contains ---"
         for img in "$B"/initramfs-linux*.img; do
             [ -f "$img" ] || continue
-            printf '      %s: ' "$(basename "$img")"
-            if command -v lsinitcpio >/dev/null 2>&1; then
-                lsinitcpio "$img" 2>/dev/null | grep -E 'etc/crypttab|cmesh-luks.key' | tr '\n' ' '; echo
-            else
-                zstd -dc "$img" 2>/dev/null | grep -aq 'cryptroot' && echo "contains cryptroot" || echo "NO cryptroot reference"
+            echo "      $(basename "$img"): $(stat -c %s "$img") bytes"
+            listing=$(list_initramfs "$img")
+            if [ -z "$listing" ]; then
+                echo "      (could not list the archive; install zstd or dracut's lsinitrd in the rescue)"
+                continue
             fi
+            if command -v lsinitcpio >/dev/null 2>&1 || command -v lsinitrd >/dev/null 2>&1 || command -v zstd >/dev/null 2>&1; then
+                echo "      (full listing: $(printf '%s\n' "$listing" | wc -l) entries)"
+            else
+                echo "      (NO zstd/lsinitcpio/lsinitrd in this rescue: raw-string scan only, so '-' below"
+                echo "       means 'not visible', not 'absent'. apt install zstd, then rerun, for a real answer)"
+            fi
+            # One line per thing the boot depends on. "-" means it is NOT in the image.
+            for want in usr/bin/mdadm 63-md-raid-arrays.rules 64-md-raid-assembly.rules etc/mdadm.conf \
+                        raid1.ko nvme.ko simpledrm.ko systemd-cryptsetup etc/crypttab cmesh-luks.key; do
+                if printf '%s\n' "$listing" | grep -q -- "$want"; then
+                    printf '        +  %s\n' "$want"
+                else
+                    printf '        -  %s\n' "$want"
+                fi
+            done
         done
         umount "$B"
     else
@@ -172,7 +242,14 @@ else
 fi
 
 hdr "9. ESPs: is the removable loader present?"
-for esp in $(blkid -o device -t PARTTYPE=c12a7328-f81f-11d2-ba4b-00a0c93ec93b 2>/dev/null); do
+# blkid's PARTTYPE query returns nothing in OVHcloud's rescue (as does lsblk's PARTTYPE
+# column on the deployer), so fall back to the label the deployer gives every ESP, then to
+# any vfat partition.
+ESPS=$(blkid -o device -t PARTTYPE=c12a7328-f81f-11d2-ba4b-00a0c93ec93b 2>/dev/null)
+[ -n "$ESPS" ] || ESPS=$(blkid -o device -t LABEL=EFI_SYSPART 2>/dev/null)
+[ -n "$ESPS" ] || ESPS=$(blkid -o device -t TYPE=vfat 2>/dev/null)
+[ -n "$ESPS" ] || echo "  no ESP found by partition type, label or vfat"
+for esp in $ESPS; do
     E=$(mktemp -d)
     if mount -o ro "$esp" "$E" 2>/dev/null; then
         if [ -f "$E/EFI/BOOT/BOOTX64.EFI" ]; then

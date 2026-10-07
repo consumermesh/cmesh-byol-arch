@@ -190,14 +190,45 @@ wait_for_config_drive() {
     return 0
 }
 
+# Where the user-data lives on a mounted config drive. Two layouts exist and OVHcloud
+# uses the second:
+#
+#   NoCloud          LABEL=cidata     /user-data                    (vfat, what the
+#                                                                     README's wording
+#                                                                     suggested)
+#   OpenStack v2     LABEL=config-2   /openstack/latest/user_data   (iso9660, what the
+#                                                                     deployer actually
+#                                                                     writes)
+#
+# The first deployment with the payload layout died here: the drive was found, mounted,
+# and had no /user-data, because it is an OpenStack config drive -- blkid shows it as
+# TYPE="iso9660" LABEL="config-2" -- and its user data is at openstack/latest/user_data.
+# The error said "no cmesh_luks_passphrase found", which was true and useless. Every
+# layout cloud-init itself would read is tried, and the caller lists the drive when none
+# matches, so the next variant names itself.
+#
+# CMESH-CONFIG-DRIVE-PATH-BEGIN (test/config-drive-test.sh extracts this function)
+config_drive_user_data() { # config_drive_user_data <mountpoint> -> path on stdout, or 1
+    local mnt="$1" p
+    for p in "$mnt/user-data" "$mnt/openstack/latest/user_data" "$mnt/ec2/latest/user-data"; do
+        [ -f "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    # No "latest": take the newest dated API version present.
+    p=$(ls -d "$mnt"/openstack/*/user_data 2>/dev/null | sort -r | head -1)
+    [ -n "$p" ] && [ -f "$p" ] && { printf '%s\n' "$p"; return 0; }
+    return 1
+}
+# CMESH-CONFIG-DRIVE-PATH-END
+
 read_passphrase() {
     # Supplied via cloud-init configDriveUserData, e.g.:
     #   cmesh_luks_passphrase: "correct horse battery staple"
     #   ssh_authorized_keys:
     #     - ssh-ed25519 AAAA... you@host
     #
-    # The config drive is a small vfat partition labelled 'cidata' or 'config-2'. It is
-    # read here — before anything is destroyed — and scrubbed later.
+    # The config drive is a small partition labelled 'cidata' or 'config-2' (on OVHcloud:
+    # iso9660, OpenStack layout -- see config_drive_user_data). It is read here — before
+    # anything is destroyed — and scrubbed later.
     #
     # The SSH keys are read in the same pass, from the same file, and for the same
     # reason: this is the last moment the config drive exists. Relying on cloud-init to
@@ -215,12 +246,15 @@ read_passphrase() {
     LUKS_PASSPHRASE=""
     CMESH_SSH_KEYS=""
 
-    for dev in $(blkid -o device -t LABEL=cidata 2>/dev/null; blkid -o device -t LABEL=config-2 2>/dev/null); do
+    local ud seen=""
+    for dev in $(config_drive_devices); do
         if mount -o ro "$dev" "$cd_mnt" 2>/dev/null; then
-            if [ -f "$cd_mnt/user-data" ]; then
+            seen="${seen}${dev}: $(blkid -o value -s TYPE "$dev" 2>/dev/null) $(find "$cd_mnt" -maxdepth 3 -type f 2>/dev/null | sed "s|^$cd_mnt||" | tr '\n' ' ')"$'\n'
+            if ud=$(config_drive_user_data "$cd_mnt"); then
+                log "config drive ${dev}: user data at ${ud#"$cd_mnt"}"
                 # Take the last match: later keys win, and it tolerates a commented
                 # example line above the real one.
-                LUKS_PASSPHRASE=$(grep -E '^[[:space:]]*cmesh_luks_passphrase:' "$cd_mnt/user-data" \
+                LUKS_PASSPHRASE=$(grep -E '^[[:space:]]*cmesh_luks_passphrase:' "$ud" \
                     | tail -1 | sed -E 's/^[^:]*:[[:space:]]*//; s/^["'"'"']//; s/["'"'"']$//')
 
                 # ssh_authorized_keys is a YAML list, so the keys are the indented "- "
@@ -241,16 +275,23 @@ read_passphrase() {
                         }
                         inseck = 0
                     }
-                ' "$cd_mnt/user-data")
+                ' "$ud")
                 # CMESH-SSH-KEY-PARSER-END
+            else
+                warn "config drive ${dev} has no user data in any known layout"
             fi
             umount "$cd_mnt"
             [ -n "${LUKS_PASSPHRASE:-}" ] && break
+        else
+            warn "config drive ${dev} could not be mounted"
         fi
     done
 
-    [ -n "$LUKS_PASSPHRASE" ] || die \
-        "no cmesh_luks_passphrase found on the config drive. Set it in configDriveUserData (base64-encoded cloud-config)."
+    if [ -z "$LUKS_PASSPHRASE" ]; then
+        warn "config drives seen (device: fstype files):"
+        printf '%s' "$seen" | sed 's/^/    /' >&2
+        die "no cmesh_luks_passphrase found on the config drive. Set it in configDriveUserData (base64-encoded cloud-config)."
+    fi
 
     [ "${#LUKS_PASSPHRASE}" -ge 12 ] || die \
         "cmesh_luks_passphrase is too short (${#LUKS_PASSPHRASE} chars); use at least 12"
@@ -594,10 +635,15 @@ scrub_config_drive() {
     # The passphrase was on the config drive in cleartext. Overwrite it so the only
     # remaining copy is inside the LUKS keyslots.
     log "scrubbing the config drive"
-    local dev
-    for dev in $(blkid -o device -t LABEL=cidata 2>/dev/null; blkid -o device -t LABEL=config-2 2>/dev/null); do
-        if dd if=/dev/urandom of="$dev" bs=1M count=8 status=none 2>/dev/null; then
-            log "scrubbed ${dev}"
+    # The whole device, sized from the device: OVHcloud's drive is 2 MiB, and a fixed
+    # 8 MiB write runs off the end, which dd reports as a failure after it has in fact
+    # overwritten everything.
+    local dev size
+    for dev in $(config_drive_devices); do
+        size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
+        if [ "$size" -gt 0 ] \
+            && dd if=/dev/urandom of="$dev" bs=4096 count=$((size / 4096)) conv=fsync status=none 2>/dev/null; then
+            log "scrubbed ${dev} (${size} bytes)"
         else
             warn "could not scrub ${dev} — the passphrase may remain on it"
         fi

@@ -337,6 +337,9 @@ Roughly two minutes after the deployer finishes:
    `/boot/efi` are mounted, `/data` is a RAID1 array with one member on each of two
    disks, and nothing else holds those members.
 2. It reads `cmesh_luks_passphrase` (and the SSH keys) from the config drive into memory.
+   OVHcloud's config drive is OpenStack-format (iso9660, `LABEL=config-2`) and keeps the
+   user data at `openstack/latest/user_data`; the NoCloud `/user-data` layout is accepted
+   too.
 3. It unmounts `/data`, stops its array, and wipes the md superblocks from both members.
    Nothing else on the disks is touched.
 4. It LUKS-formats both members, opens them as `cryptroot0`/`cryptroot1`, and creates
@@ -359,6 +362,16 @@ Roughly two minutes after the deployer finishes:
 If any step fails the installer logs to the serial console and to
 `/var/log/cmesh-byol-install.log`, and does **not** mark itself complete — so you can
 read the failure over KVM rather than guessing.
+
+> **If the console goes silent right after `Loading initial ramdisk ...`**, the kernel is
+> not on the console you are watching. OVHcloud's operator console is a serial line, and
+> the deploy hook copies the deployer kernel's `console=` parameters into GRUB (exactly as
+> OVHcloud's reference hooks do) so that the kernel, the installer and the installed
+> system all print there. An image built before that step existed boots with no
+> `console=` at all and prints to the VGA framebuffer only — every failure *and every
+> success* looks like a hang. Boot rescue mode and run `test/post-install-probe.sh`: it
+> prints the deploy hook's log, the journal of every boot the kernel actually reached,
+> what the initramfs contains, and the kernel lines in `grub.cfg`.
 
 ### About the temporary keyfile
 

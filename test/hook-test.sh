@@ -78,6 +78,8 @@ sed \
     -e "s#/var/log#$SB/var/log#g" \
     -e "s#/proc/mounts#$SB/proc/mounts#g" \
     -e "s#/proc/partitions#$SB/proc/partitions#g" \
+    -e "s#/proc/cmdline#$SB/proc/cmdline#g" \
+    -e "s#/etc/default/grub#$SB/etc/default/grub#g" \
     -e "s#/sys/firmware/efi#$SB/sys-firmware-efi#g" \
     -e "s#/etc/mkinitcpio.conf#$SB/etc/mkinitcpio.conf#g" \
     -e "s#/etc/fstab#$SB/etc/fstab#g" \
@@ -192,6 +194,21 @@ reset_env() {
     # on the real target.
     printf '/dev/nvme1n1p1 %s/boot/efi vfat rw,relatime 0 0\n' "$SB" > "$SB/proc/mounts"
     printf 'LABEL=EFI_SYSPART %s/boot/efi vfat defaults 0 1\n' "$SB" > "$SB/etc/fstab"
+    # The deployer's kernel runs on a serial console; the OVHcloud reference hooks copy
+    # its console= parameters into GRUB. run() overrides the whole line via STUB_CMDLINE.
+    printf 'BOOT_IMAGE=/vmlinuz ro console=tty0 console=ttyS1,115200n8 quiet\n' > "$SB/proc/cmdline"
+    # /etc/default/grub exactly as provision.sh leaves it in the image: the cloud image's
+    # serial terminal survives, the kernel cmdline does not carry a console.
+    mkdir -p "$SB/etc/default"
+    cat > "$SB/etc/default/grub" <<'GRUBDEF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=1
+GRUB_CMDLINE_LINUX_DEFAULT=""
+GRUB_CMDLINE_LINUX="nomodeset iommu=pt"
+GRUB_GFXPAYLOAD_LINUX="text"
+GRUB_TERMINAL="serial console"
+GRUB_SERIAL_COMMAND="serial --speed=115200"
+GRUBDEF
 }
 
 RC=0
@@ -199,8 +216,12 @@ OUT=""
 LOG=""
 
 run() { # run <label> [KEY=VALUE ...]
-    local label="$1"; shift
+    local label="$1" kv; shift
     reset_env
+    # STUB_CMDLINE is a file the hook reads, not an environment variable it sees.
+    for kv in "$@"; do
+        case "$kv" in STUB_CMDLINE=*) printf '%s\n' "${kv#STUB_CMDLINE=}" > "$SB/proc/cmdline" ;; esac
+    done
     OUT="$WORK/$label.out"
     env "$@" PATH="$BIN:$PATH" bash "$WORK/hook-sandboxed.sh" > "$OUT" 2>&1
     RC=$?
@@ -264,6 +285,49 @@ check "raw blkid output logged"                 1 "$(grep -q 'blkid (raw)' "$LOG
 check "vfat mounts logged"                      1 "$(grep -q 'mounts (vfat)' "$LOG" && echo 1 || echo 0)"
 check "fstab logged"                            1 "$(grep -q 'fstab' "$LOG" && echo 1 || echo 0)"
 check "mount table logged"                      1 "$(grep -q 'mount table' "$LOG" && echo 1 || echo 0)"
+check "deployer cmdline logged"                 1 "$(grep -q 'deployer cmdline' "$LOG" && echo 1 || echo 0)"
+
+echo
+echo "the kernel is put on the console the operator watches (OVHcloud reference behaviour)"
+run console
+GRUBDEF="$SB/etc/default/grub"
+cmdline_now() { sed -n 's/^GRUB_CMDLINE_LINUX="\(.*\)"/\1/p' "$GRUBDEF"; }
+check "exits zero"                              0 "$RC"
+check "console=tty0 carried into GRUB_CMDLINE_LINUX" \
+    1 "$(cmdline_now | grep -q 'console=tty0' && echo 1 || echo 0)"
+check "console=ttyS1,115200n8 carried into GRUB_CMDLINE_LINUX" \
+    1 "$(cmdline_now | grep -q 'console=ttyS1,115200n8' && echo 1 || echo 0)"
+check "existing parameters kept" \
+    1 "$(cmdline_now | grep -q '^nomodeset iommu=pt ' && echo 1 || echo 0)"
+check "serial console is LAST, so /dev/console is the serial line" \
+    1 "$(cmdline_now | grep -qE 'console=ttyS1,115200n8$' && echo 1 || echo 0)"
+check "GRUB terminal switched to console serial" \
+    1 "$(grep -q '^GRUB_TERMINAL="console serial"$' "$GRUBDEF" && echo 1 || echo 0)"
+check "GRUB serial command follows the deployer (unit 1, 115200, no parity, 8 bits)" \
+    1 "$(grep -q '^GRUB_SERIAL_COMMAND="serial --unit=1 --speed=115200 --parity=no --word=8"$' "$GRUBDEF" && echo 1 || echo 0)"
+check "console configured BEFORE grub-mkconfig" \
+    1 "$(awk '/OK   configure console/{c=NR} /grub-mkconfig\(stub\)/{m=NR} END{exit !(c && m && c < m)}' "$OUT" && echo 1 || echo 0)"
+check "step recorded in the log"                1 "$(grep -q 'OK   configure console' "$LOG" && echo 1 || echo 0)"
+
+# A second run on the same /etc/default/grub must not grow the cmdline.
+env PATH="$BIN:$PATH" bash "$WORK/hook-sandboxed.sh" > "$WORK/console2.out" 2>&1
+check "idempotent: console= appears once each after a second run" \
+    "1 1" "$(printf '%s %s' "$(cmdline_now | grep -o 'console=tty0' | wc -l)" "$(cmdline_now | grep -o 'console=ttyS1,115200n8' | wc -l)")"
+
+run console_none STUB_CMDLINE="BOOT_IMAGE=/vmlinuz ro quiet"
+check "no console= in the deployer: exit 0"     0 "$RC"
+check "  GRUB_CMDLINE_LINUX untouched" \
+    1 "$(grep -q '^GRUB_CMDLINE_LINUX="nomodeset iommu=pt"$' "$GRUBDEF" && echo 1 || echo 0)"
+check "  GRUB terminal untouched" \
+    1 "$(grep -q '^GRUB_TERMINAL="serial console"$' "$GRUBDEF" && echo 1 || echo 0)"
+check "  says so in the log" \
+    1 "$(grep -q 'no console= parameter' "$LOG" && echo 1 || echo 0)"
+
+run console_vga_only STUB_CMDLINE="BOOT_IMAGE=/vmlinuz ro console=tty0"
+check "VGA-only console: kernel cmdline gets console=tty0" \
+    1 "$(cmdline_now | grep -q 'console=tty0' && echo 1 || echo 0)"
+check "  GRUB serial command left as built" \
+    1 "$(grep -q '^GRUB_SERIAL_COMMAND="serial --speed=115200"$' "$GRUBDEF" && echo 1 || echo 0)"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

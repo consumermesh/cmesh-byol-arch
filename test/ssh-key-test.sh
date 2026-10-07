@@ -42,7 +42,7 @@ check() { # check <description> <expected> <actual>
 # inside a single-quoted shell string, so undoing it is just replacing that 5-character
 # sequence with one apostrophe.
 sed -n '/CMESH-SSH-KEY-PARSER-BEGIN/,/CMESH-SSH-KEY-PARSER-END/p' "$INSTALLER" \
-    | sed -n '/awk .*'"'"'$/,/^ *'"'"' "\$cd_mnt\/user-data")/p' \
+    | sed -n '/awk .*'"'"'$/,/^ *'"'"' "\$ud")/p' \
     > "$WORK/parser-raw.txt"
 
 if [ ! -s "$WORK/parser-raw.txt" ]; then
@@ -51,9 +51,9 @@ if [ ! -s "$WORK/parser-raw.txt" ]; then
     exit 1
 fi
 
-# Strip the leading `awk '` and the trailing `' "$cd_mnt/user-data")`, then unescape.
+# Strip the leading `awk '` and the trailing `' "$ud")`, then unescape.
 sed -e "1s/.*awk '//" \
-    -e '$s/'"'"' "\$cd_mnt\/user-data").*$//' \
+    -e '$s/'"'"' "\$ud").*$//' \
     "$WORK/parser-raw.txt" | sed "s/'\"'\"'/'/g" > "$WORK/parser.awk"
 
 if ! awk -f "$WORK/parser.awk" /dev/null >/dev/null 2>&1; then

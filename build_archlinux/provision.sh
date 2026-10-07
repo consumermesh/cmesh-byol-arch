@@ -326,6 +326,91 @@ echo "--- mounts (vfat) ---";    grep -i vfat /proc/mounts        2>&1 | sed 's/
 echo "--- mount table ---";      findmnt -rno TARGET,SOURCE,FSTYPE,OPTIONS 2>&1 | sed 's/^/  /'
 echo "--- /boot/efi ---";        ls -la /boot/efi                 2>&1 | sed 's/^/  /'
 echo "--- /etc/fstab ---";       cat /etc/fstab                   2>&1 | sed 's/^/  /'
+echo "--- deployer cmdline ---";  cat /proc/cmdline                2>&1 | sed 's/^/  /'
+
+### Console: put the kernel where the operator can see it ###
+
+# THIS IS WHY EVERY FAILED BOOT LOOKED THE SAME. The console an OVHcloud operator watches
+# is a serial line, and the deployer's own kernel is booted with the matching
+# console=ttyS<n>,<speed> parameters. The Arch cloud image's GRUB already writes to serial
+# (GRUB_TERMINAL="serial console"), which is why the GRUB menu and "Loading initial
+# ramdisk ..." are visible -- but provision.sh blanks GRUB_CMDLINE_LINUX_DEFAULT, so the
+# kernel boots with NO console= at all, prints to the VGA framebuffer only, and the serial
+# line goes silent at exactly that line. Whatever happens next -- a missing root device,
+# a panic, or a perfectly good boot -- is invisible, and was mis-read as a hang.
+#
+# Every one of OVHcloud's reference hooks (Arch, Alpine, Debian, Ubuntu) starts by copying
+# the deployer's console= parameters into GRUB_CMDLINE_LINUX and configuring GRUB's serial
+# terminal to match. This is that step, ported verbatim in behaviour; it runs BEFORE
+# grub-mkconfig so the generated grub.cfg carries it. The installer later rsyncs this
+# /etc/default/grub into the encrypted system and regenerates its grub.cfg from it, and
+# its own log is tee'd to /dev/console, which lands on the LAST console= listed -- so the
+# install itself becomes readable over the same line.
+configure_console() {
+    local cmdline console_params current param
+    cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
+    console_params="$(printf '%s\n' "$cmdline" | grep -oP 'console=\S+' || true)"
+    if [ -z "$console_params" ]; then
+        log "deployer cmdline carries no console= parameter; leaving GRUB as built"
+        return 0
+    fi
+    if [ ! -f /etc/default/grub ]; then
+        warn "/etc/default/grub is missing; cannot carry console= into the kernel cmdline"
+        return 1
+    fi
+
+    current="$(sed -n 's/^GRUB_CMDLINE_LINUX="\(.*\)"/\1/p' /etc/default/grub)"
+    for param in $console_params; do
+        printf ' %s ' "$current" | grep -qF " $param " || current="$current $param"
+    done
+    current="$(printf '%s' "$current" | sed 's/^ *//')"
+    if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub; then
+        sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"$current\"|" /etc/default/grub
+    else
+        printf 'GRUB_CMDLINE_LINUX="%s"\n' "$current" >> /etc/default/grub
+    fi
+    log "kernel console: $(printf '%s' "$console_params" | tr '\n' ' ')"
+
+    # GRUB's own terminal follows the last serial console listed, so the menu, "Loading
+    # Linux", and any GRUB error are on the same line as the kernel.
+    local serial_param tty_part settings_part unit speed parity_char parity word serial_cmd
+    serial_param="$(printf '%s\n' "$console_params" | grep 'ttyS' | tail -1 || true)"
+    if [ -z "$serial_param" ]; then
+        log "no serial console in the deployer cmdline; GRUB terminal left as built"
+        return 0
+    fi
+    tty_part="$(printf '%s' "$serial_param" | sed 's/console=//' | cut -d, -f1)"
+    settings_part="$(printf '%s' "$serial_param" | sed 's/console=//' | cut -d, -f2 -s)"
+    unit="$(printf '%s' "$tty_part" | sed 's/ttyS//')"
+    speed="$(printf '%s' "$settings_part" | grep -oP '^\d+' || true)"
+    parity_char="$(printf '%s' "$settings_part" | grep -oP '\d+\K[noe]' || true)"
+    word="$(printf '%s' "$settings_part" | grep -oP '[noe]\K\d' || true)"
+    case "$parity_char" in
+        o) parity=odd ;;
+        e) parity=even ;;
+        *) parity=no ;;
+    esac
+    serial_cmd="serial --unit=${unit:-0} --speed=${speed:-115200} --parity=${parity} --word=${word:-8}"
+
+    if grep -q '^GRUB_TERMINAL=' /etc/default/grub; then
+        sed -i 's|^GRUB_TERMINAL=.*|GRUB_TERMINAL="console serial"|' /etc/default/grub
+    else
+        echo 'GRUB_TERMINAL="console serial"' >> /etc/default/grub
+    fi
+    if grep -q '^GRUB_SERIAL_COMMAND=' /etc/default/grub; then
+        sed -i "s|^GRUB_SERIAL_COMMAND=.*|GRUB_SERIAL_COMMAND=\"$serial_cmd\"|" /etc/default/grub
+    else
+        printf 'GRUB_SERIAL_COMMAND="%s"\n' "$serial_cmd" >> /etc/default/grub
+    fi
+    log "GRUB terminal: $serial_cmd"
+    return 0
+}
+
+log "configuring the console from the deployer's cmdline"
+configure_console
+step "configure console" $?
+echo "--- /etc/default/grub (after) ---"
+grep -E '^GRUB_(CMDLINE_LINUX|CMDLINE_LINUX_DEFAULT|TERMINAL|SERIAL_COMMAND)=' /etc/default/grub 2>&1 | sed 's/^/  /'
 
 ### Locate the EFI System Partition ###
 
