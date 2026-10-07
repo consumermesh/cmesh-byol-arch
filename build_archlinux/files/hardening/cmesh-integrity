@@ -1,0 +1,137 @@
+#!/bin/bash
+# cmesh-integrity — file-integrity monitoring without AIDE (which is not in the Arch
+# repos).
+#
+#   cmesh-integrity init     write the baseline (first run; also what `accept` does)
+#   cmesh-integrity check    compare the host to the baseline; alert on any difference
+#   cmesh-integrity accept   re-baseline after an intentional change (pacman runs this
+#                            from a hook after every transaction, so package upgrades do
+#                            not raise alerts and everything else does)
+#
+# Two sources of truth:
+#   1. pacman -Qkk: every file owned by a package, against the package's own mtree
+#      (sha256, size, mode, owner). Covers /usr, /etc defaults, and anything else pacman
+#      installed. Changing a binary under /usr/bin shows up here.
+#   2. A sha256 manifest of the paths that pacman does NOT own or that are expected to be
+#      edited locally: /etc, /boot, /usr/local, the systemd unit tree, authorized_keys,
+#      the audit rules, cron, and this tool's own install.
+#
+# The baseline lives on the encrypted root under /var/lib/cmesh-byol/integrity. An
+# intruder with root can re-baseline, which is why the alert also goes to the journal:
+# ship the journal off the box and the re-baseline itself is evidence.
+set -uo pipefail
+
+# The CMESH_INTEGRITY_* variables exist so test/hardening-test.sh can exercise this on a
+# scratch tree; leave them unset on a real host.
+STATE="${CMESH_INTEGRITY_STATE:-/var/lib/cmesh-byol/integrity}"
+MANIFEST="$STATE/manifest.sha256"
+PKGSTATE="$STATE/pacman-Qkk.txt"
+ALERT="${CMESH_INTEGRITY_ALERT:-/usr/local/sbin/cmesh-alert}"
+
+# Paths covered by the manifest. Directories are walked; missing paths are skipped.
+if [ -n "${CMESH_INTEGRITY_WATCH:-}" ]; then
+    read -r -a WATCH <<< "$CMESH_INTEGRITY_WATCH"
+else
+    WATCH=(
+        /etc
+        /boot
+        /usr/local
+        /usr/lib/systemd/system
+        /root/.ssh
+        /var/spool/cron
+    )
+fi
+# Noise that changes on its own and carries no security meaning.
+PRUNE_RE='^/etc/(mtab|resolv\.conf|\.updated|\.pwd\.lock|ld\.so\.cache|machine-id|adjtime)$|^/boot/grub/grubenv$|^/etc/pacman\.d/gnupg/|^/etc/ssl/certs/'
+
+walk() {
+    local p
+    for p in "${WATCH[@]}"; do
+        [ -e "$p" ] || continue
+        find "$p" -xdev \( -type f -o -type l \) 2>/dev/null
+    done | grep -Ev "$PRUNE_RE" | LC_ALL=C sort -u
+}
+
+manifest() {
+    # sha256 of regular files; symlinks are recorded as their target so a redirected
+    # link is a change too.
+    walk | while IFS= read -r f; do
+        if [ -L "$f" ]; then
+            printf 'LINK:%s  %s\n' "$(readlink "$f" | sha256sum | cut -c1-64)" "$f"
+        else
+            sha256sum -- "$f" 2>/dev/null || printf 'UNREADABLE  %s\n' "$f"
+        fi
+    done
+}
+
+pkgstate() {
+    # -Qkk: full mtree check. The per-package summary lines ("N total files, M altered")
+    # are dropped; only the altered-file warnings remain, sorted, so diff is meaningful.
+    # Backup (config) files that differ are reported by pacman too; they are expected to
+    # differ and are covered by the manifest instead, so they are filtered here.
+    command -v pacman >/dev/null 2>&1 || return 0
+    LC_ALL=C pacman -Qkk 2>&1 \
+        | grep -E '^(warning|error):' \
+        | grep -Ev '\(Modification time mismatch\)$' \
+        | grep -Ev 'backup file' \
+        | LC_ALL=C sort -u
+}
+
+do_init() {
+    umask 077
+    mkdir -p "$STATE"
+    manifest > "$MANIFEST.new" && mv -f "$MANIFEST.new" "$MANIFEST"
+    pkgstate > "$PKGSTATE.new"; mv -f "$PKGSTATE.new" "$PKGSTATE"
+    date -Is > "$STATE/baseline-at"
+    logger -t cmesh-integrity -- "baseline written: $(wc -l < "$MANIFEST") files, $(wc -l < "$PKGSTATE") package warnings"
+    echo "baseline: $(wc -l < "$MANIFEST") files in manifest, $(wc -l < "$PKGSTATE") pre-existing package warnings"
+}
+
+do_check() {
+    if [ ! -f "$MANIFEST" ] || [ ! -f "$PKGSTATE" ]; then
+        "$ALERT" integrity "no baseline at ${STATE}; run cmesh-integrity init"
+        return 2
+    fi
+    local tmp; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+
+    manifest > "$tmp/manifest"
+    pkgstate > "$tmp/pkg"
+
+    # Files: changed content, new, and deleted.
+    awk '{print $NF}' "$MANIFEST"      | LC_ALL=C sort > "$tmp/old.paths"
+    awk '{print $NF}' "$tmp/manifest"  | LC_ALL=C sort > "$tmp/new.paths"
+    LC_ALL=C comm -13 "$tmp/old.paths" "$tmp/new.paths" > "$tmp/added"
+    LC_ALL=C comm -23 "$tmp/old.paths" "$tmp/new.paths" > "$tmp/removed"
+    LC_ALL=C comm -13 <(LC_ALL=C sort "$MANIFEST") <(LC_ALL=C sort "$tmp/manifest") \
+        | awk '{print $NF}' | LC_ALL=C comm -23 - "$tmp/added" > "$tmp/changed"
+
+    # Packages: warnings that are new since the baseline.
+    LC_ALL=C comm -13 "$PKGSTATE" "$tmp/pkg" > "$tmp/pkgnew"
+
+    local n_add n_rm n_ch n_pkg
+    n_add=$(wc -l < "$tmp/added"); n_rm=$(wc -l < "$tmp/removed")
+    n_ch=$(wc -l < "$tmp/changed"); n_pkg=$(wc -l < "$tmp/pkgnew")
+
+    if [ "$((n_add + n_rm + n_ch + n_pkg))" -eq 0 ]; then
+        logger -t cmesh-integrity "check ok: no change against baseline of $(cat "$STATE/baseline-at")"
+        echo "ok: no change against the baseline of $(cat "$STATE/baseline-at")"
+        return 0
+    fi
+
+    {
+        echo "integrity check FAILED against baseline of $(cat "$STATE/baseline-at"): ${n_ch} changed, ${n_add} new, ${n_rm} removed, ${n_pkg} package file(s) altered"
+        [ "$n_ch"  -gt 0 ] && sed 's/^/  changed: /' "$tmp/changed" | head -50
+        [ "$n_add" -gt 0 ] && sed 's/^/  new:     /' "$tmp/added"   | head -50
+        [ "$n_rm"  -gt 0 ] && sed 's/^/  removed: /' "$tmp/removed" | head -50
+        [ "$n_pkg" -gt 0 ] && sed 's/^/  package: /' "$tmp/pkgnew"  | head -50
+    } > "$tmp/report"
+    cat "$tmp/report"
+    "$ALERT" integrity < "$tmp/report"
+    return 1
+}
+
+case "${1:-}" in
+    init|accept) do_init ;;
+    check)       do_check ;;
+    *) echo "usage: cmesh-integrity init|check|accept" >&2; exit 64 ;;
+esac

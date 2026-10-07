@@ -1,0 +1,5 @@
+## cmesh BYOL hardening — /etc/audit/rules.d/99-cmesh-immutable.rules
+## Must sort last. -e 2 locks the ruleset: no process, root included, can change or
+## disable auditing until the next reboot. Changing rules therefore means editing
+## rules.d and rebooting; cmesh-byol-harden says so when it hits the lock.
+-e 2

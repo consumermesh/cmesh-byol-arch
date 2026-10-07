@@ -1,0 +1,124 @@
+## cmesh BYOL hardening — /etc/audit/rules.d/50-cmesh-hipaa.rules
+##
+## Audit controls (HIPAA 164.312(b)): who touched identity, authentication, privilege,
+## the boot path, the encryption, and the logs — and every command run as root. Keys
+## (-k) are what you search on: `ausearch -k identity -ts today`.
+##
+## Loaded by augenrules in filename order; 99-cmesh-immutable.rules makes the set
+## immutable until reboot, so edit here, then reboot (or `augenrules --load` before the
+## -e 2 has been applied).
+
+## Buffer and failure mode: 1 = printk on failure, never panic a production host.
+-D
+-b 8192
+--backlog_wait_time 60000
+-f 1
+
+## Self-protection: the audit configuration and logs
+-w /etc/audit/ -p wa -k auditconfig
+-w /etc/libaudit.conf -p wa -k auditconfig
+-w /var/log/audit/ -p wa -k auditlog
+-w /usr/bin/auditctl -p x -k audittools
+-w /usr/bin/auditd -p x -k audittools
+-w /usr/bin/augenrules -p x -k audittools
+
+## Identity and authentication
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/subuid -p wa -k identity
+-w /etc/subgid -p wa -k identity
+-w /etc/security/ -p wa -k identity
+-w /etc/pam.d/ -p wa -k pam
+-w /etc/login.defs -p wa -k login
+-w /etc/ssh/ -p wa -k sshd
+-w /root/.ssh/ -p wa -k rootkey
+
+## Privilege: sudo and setuid escalation
+-w /etc/sudoers -p wa -k priv
+-w /etc/sudoers.d/ -p wa -k priv
+-w /var/log/sudo.log -p wa -k priv
+-a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k setuid_exec
+-a always,exit -F arch=b32 -S execve -C uid!=euid -F euid=0 -k setuid_exec
+## Every command executed as root by a logged-in user (auid is the login identity and
+## survives su/sudo). This is the "what did the admin do" record.
+-a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 -F auid!=unset -k rootcmd
+-a always,exit -F arch=b32 -S execve -F euid=0 -F auid>=1000 -F auid!=unset -k rootcmd
+
+## Sessions and logins
+-w /var/log/lastlog -p wa -k logins
+-w /var/log/faillog -p wa -k logins
+-w /var/run/faillock/ -p wa -k logins
+-w /var/log/wtmp -p wa -k session
+-w /var/log/btmp -p wa -k session
+-w /var/run/utmp -p wa -k session
+
+## Boot path and encryption: anything that could change what runs before the root
+## is unlocked, or how it is unlocked.
+-w /boot/ -p wa -k bootpath
+-w /etc/default/grub -p wa -k bootpath
+-w /etc/mkinitcpio.conf -p wa -k bootpath
+-w /etc/mkinitcpio.conf.d/ -p wa -k bootpath
+-w /etc/crypttab -p wa -k luks
+-w /etc/crypttab.initramfs -p wa -k luks
+-w /etc/mdadm.conf -p wa -k raid
+-w /usr/bin/cryptsetup -p x -k luks
+-w /usr/bin/systemd-cryptenroll -p x -k luks
+-w /usr/bin/mdadm -p x -k raid
+-w /usr/local/sbin/ -p wa -k localsbin
+
+## System configuration
+-w /etc/systemd/ -p wa -k systemd
+-w /etc/fstab -p wa -k mounts
+-w /etc/hostname -p wa -k network
+-w /etc/hosts -p wa -k network
+-w /etc/nftables.conf -p wa -k firewall
+-w /etc/sysctl.d/ -p wa -k sysctl
+-w /etc/sysctl.conf -p wa -k sysctl
+-w /etc/modprobe.d/ -p wa -k modules
+-w /etc/pacman.conf -p wa -k packages
+-w /etc/pacman.d/ -p wa -k packages
+-w /var/log/pacman.log -p wa -k packages
+-a always,exit -F arch=b64 -S sethostname,setdomainname -k network
+-a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time
+-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime -k time
+-w /etc/localtime -p wa -k time
+
+## Kernel modules and mounts
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k modules
+-a always,exit -F arch=b32 -S init_module,finit_module,delete_module -k modules
+-w /usr/bin/modprobe -p x -k modules
+-w /usr/bin/insmod -p x -k modules
+-w /usr/bin/rmmod -p x -k modules
+-a always,exit -F arch=b64 -S mount,umount2 -F auid>=1000 -F auid!=unset -k mounts
+-a always,exit -F arch=b32 -S mount,umount2 -F auid>=1000 -F auid!=unset -k mounts
+-a always,exit -F arch=b64 -S swapon,swapoff -k swap
+-a always,exit -F arch=b64 -S kexec_load,kexec_file_load -k kexec
+-a always,exit -F arch=b64 -S ptrace -k tracing
+
+## Unauthorised access attempts: failed opens and truncations by real users
+-a always,exit -F arch=b64 -S open,openat,openat2,creat,truncate,ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=unset -k access
+-a always,exit -F arch=b64 -S open,openat,openat2,creat,truncate,ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=unset -k access
+-a always,exit -F arch=b32 -S open,openat,openat2,creat,truncate,ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=unset -k access
+-a always,exit -F arch=b32 -S open,openat,openat2,creat,truncate,ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=unset -k access
+
+## Permission and ownership changes, and deletions, by real users
+-a always,exit -F arch=b64 -S chmod,fchmod,fchmodat,fchmodat2,chown,fchown,fchownat,lchown,setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b32 -S chmod,fchmod,fchmodat,fchmodat2,chown,fchown,fchownat,lchown,setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b64 -S unlink,unlinkat,rename,renameat,renameat2 -F auid>=1000 -F auid!=unset -k delete
+-a always,exit -F arch=b32 -S unlink,unlinkat,rename,renameat,renameat2 -F auid>=1000 -F auid!=unset -k delete
+
+## Tools an intruder reaches for
+-w /usr/bin/su -p x -k priv
+-w /usr/bin/sudo -p x -k priv
+-w /usr/bin/passwd -p x -k identity
+-w /usr/bin/chage -p x -k identity
+-w /usr/bin/usermod -p x -k identity
+-w /usr/bin/useradd -p x -k identity
+-w /usr/bin/userdel -p x -k identity
+-w /usr/bin/gpasswd -p x -k identity
+-w /usr/bin/nft -p x -k firewall
+-w /usr/bin/ssh-keygen -p x -k sshkeys
+-w /usr/bin/setfacl -p x -k perm_mod
+-w /usr/bin/chacl -p x -k perm_mod

@@ -1,0 +1,22 @@
+#!/bin/bash
+# cmesh-arch-audit — compare installed packages with the Arch security tracker.
+# Run daily by cmesh-arch-audit.timer. arch-audit exits 0 whether or not it finds
+# anything, so the output is the signal: packages with a fix already in the repos go to
+# cmesh-alert (actionable: pacman -Syu), the full list including unfixed CVEs goes to
+# the journal under arch-audit-unfixed for the record.
+set -uo pipefail
+fixed=$(arch-audit --color never -u --format '%n %v %s %c' 2>&1)
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    logger -t arch-audit -p daemon.warning "arch-audit failed (rc=${rc}): ${fixed}"
+    exit 0
+fi
+if [ -n "$fixed" ]; then
+    printf '%s\n' "$fixed" | logger -t arch-audit -p daemon.warning
+    { echo "packages with a security fix waiting for pacman -Syu:"; printf '%s\n' "$fixed"; } \
+        | /usr/local/sbin/cmesh-alert arch-audit
+else
+    logger -t arch-audit "no installed package has an unapplied security fix"
+fi
+arch-audit --color never --format '%n %v %s' 2>&1 | logger -t arch-audit-unfixed
+exit 0

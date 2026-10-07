@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily check of installed packages against the Arch security tracker
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

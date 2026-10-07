@@ -1,0 +1,16 @@
+[Unit]
+Description=cmesh file-integrity baseline (first boot of the installed system)
+# Only once, only on the installed system, and only after finalize has rebuilt the
+# initramfs and removed the keyfile -- otherwise the baseline captures a /boot that is
+# about to change.
+ConditionPathExists=!/var/lib/cmesh-byol/integrity/manifest.sha256
+ConditionPathExists=/var/lib/cmesh-byol/finalized
+After=cmesh-byol-finalize.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cmesh-integrity init
+
+[Install]
+WantedBy=multi-user.target

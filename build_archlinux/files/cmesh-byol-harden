@@ -1,0 +1,359 @@
+#!/bin/bash
+# cmesh-byol-harden — host hardening and monitoring for a HIPAA-scoped server.
+#
+# Runs in two places:
+#   * at image build, from provision.sh (--build): installs packages and files, enables
+#     units, touches nothing that is running. The installer then copies the result into
+#     the encrypted system.
+#   * on a live server, by an admin (no flag): same, plus applies everything now —
+#     reloads sshd, loads the firewall, sysctl, audit rules — and creates the admin
+#     account from root's keys if the machine was installed before this existed.
+#
+# It is idempotent: run it again after editing a file under /usr/share/cmesh-byol/
+# hardening and it re-installs and re-applies. --status reports without changing
+# anything.
+#
+# Order matters for two things, both guarded:
+#   * sshd: the new config is validated with `sshd -t` before sshd is reloaded, and the
+#     drop-in is removed again if validation fails. Root login is only disabled once a
+#     wheel user with a non-empty authorized_keys exists.
+#   * nftables: the ruleset accepts established connections before anything else, so the
+#     SSH session that loads it survives. It is checked with `nft -c` first.
+#
+# Usage: cmesh-byol-harden [--build] [--files DIR] [--admin-user NAME] [--status]
+set -uo pipefail
+
+FILES=""
+BUILD=0
+STATUS=0
+ADMIN_USER="${CMESH_ADMIN_USER:-admin}"
+LOG=/var/log/cmesh-byol-harden.log
+SHARE=/usr/share/cmesh-byol/hardening
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --build)       BUILD=1 ;;
+        --status)      STATUS=1 ;;
+        --files)       FILES="$2"; shift ;;
+        --admin-user)  ADMIN_USER="$2"; shift ;;
+        -h|--help)     sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//' | head -n -1; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 64 ;;
+    esac
+    shift
+done
+
+WARNINGS=0
+log()  { printf '\n=== %s\n' "$*"; }
+ok()   { printf '  ok    %s\n' "$*"; }
+warn() { printf '  WARN  %s\n' "$*" >&2; WARNINGS=$((WARNINGS + 1)); }
+die()  { printf '\nFATAL: %s\n' "$*" >&2; exit 1; }
+live() { [ "$BUILD" -eq 0 ]; }
+
+PKGS=(nftables audit sshguard smartmontools arch-audit sudo apparmor openssh mdadm)
+# mdmonitor.service is not here: it has no [Install] section and is pulled in by the
+# md-raid udev rule whenever an array exists; the override above gives it --syslog.
+UNITS=(nftables.service auditd.service sshguard.service smartd.service
+       apparmor.service systemd-timesyncd.service
+       cmesh-arch-audit.timer cmesh-integrity.timer cmesh-integrity-init.service)
+
+### --status: read-only report ########################################################
+
+status() {
+    local u
+    echo "cmesh-byol-harden status on $(hostname) ($(date -Is))"
+    echo
+    echo "units:"
+    for u in "${UNITS[@]}" mdmonitor.service; do
+        printf '  %-32s enabled=%-9s active=%s\n' "$u" \
+            "$(systemctl is-enabled "$u" 2>/dev/null || echo '-')" \
+            "$(systemctl is-active "$u" 2>/dev/null || echo '-')"
+    done
+    echo
+    echo "sshd (effective):"
+    if command -v sshd >/dev/null; then
+        sshd -T 2>/dev/null | grep -iE '^(permitrootlogin|allowusers|passwordauthentication|kbdinteractiveauthentication|authenticationmethods|clientaliveinterval|clientalivecountmax|maxauthtries|banner|loglevel|x11forwarding|allowtcpforwarding) ' | sed 's/^/  /'
+    fi
+    echo
+    echo "admin accounts (wheel, with keys):"
+    local m
+    for m in $(getent group wheel | cut -d: -f4 | tr ',' ' '); do
+        local h; h=$(getent passwd "$m" | cut -d: -f6)
+        printf '  %-16s keys=%s\n' "$m" "$( [ -s "$h/.ssh/authorized_keys" ] && grep -c . "$h/.ssh/authorized_keys" || echo 0)"
+    done
+    echo
+    echo "firewall:   $(nft list ruleset 2>/dev/null | grep -c '^\s*tcp dport 22' | sed 's/^/ssh rules=/') $(nft list ruleset 2>/dev/null | grep -q 'policy drop' && echo 'input policy drop' || echo 'NO DROP POLICY')"
+    echo "audit:      $(auditctl -s 2>/dev/null | tr '\n' ' ' | sed -E 's/ +/ /g' | cut -c1-120)"
+    echo "audit rules loaded: $(auditctl -l 2>/dev/null | grep -c .)"
+    echo "sysctl:     kptr_restrict=$(sysctl -n kernel.kptr_restrict 2>/dev/null) dmesg_restrict=$(sysctl -n kernel.dmesg_restrict 2>/dev/null) sysrq=$(sysctl -n kernel.sysrq 2>/dev/null) ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"
+    echo "apparmor:   $(aa-enabled 2>&1 | head -1) profiles=$(aa-status --enforced 2>/dev/null || echo '?')"
+    echo "coredumps:  $(systemd-analyze cat-config systemd/coredump.conf 2>/dev/null | grep -E '^Storage=' | tail -1)"
+    echo "journald:   $(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -E '^(Storage|Seal)=' | tail -2 | tr '\n' ' ')"
+    echo "kernel cmdline: $(grep -oE 'lsm=\S+|audit=\S+' /proc/cmdline | tr '\n' ' ')"
+    echo "integrity:  baseline $(cat /var/lib/cmesh-byol/integrity/baseline-at 2>/dev/null || echo 'NONE')"
+    echo "alerts:     $(wc -l < /var/log/cmesh-alerts.log 2>/dev/null || echo 0) lines in /var/log/cmesh-alerts.log; last: $(tail -1 /var/log/cmesh-alerts.log 2>/dev/null | cut -c1-100)"
+    echo "mdstat:     $(grep -E '^md' /proc/mdstat 2>/dev/null | awk '{print $1":"$4}' | tr '\n' ' ')"
+}
+if [ "$STATUS" -eq 1 ]; then status; exit 0; fi
+
+### Setup ###############################################################################
+
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+mkdir -p "$(dirname "$LOG")"
+exec > >(tee -a "$LOG") 2>&1
+log "cmesh-byol-harden starting ($(live && echo live || echo build) mode, admin user '${ADMIN_USER}')"
+
+# Where the files are: --files, next to this script, or the installed copy.
+if [ -z "$FILES" ]; then
+    for c in "$(dirname "$(readlink -f "$0")")/hardening" "$SHARE"; do
+        [ -f "$c/sshd-10-cmesh-hardening.conf" ] && { FILES="$c"; break; }
+    done
+fi
+[ -n "$FILES" ] && [ -f "$FILES/sshd-10-cmesh-hardening.conf" ] \
+    || die "hardening files not found (use --files DIR; looked next to the script and in ${SHARE})"
+log "files from ${FILES}"
+
+# Keep a copy so a later re-run on the server does not need the repo.
+if [ "$(readlink -f "$FILES")" != "$(readlink -f "$SHARE")" ]; then
+    install -d -m 0755 "$SHARE"
+    cp -a "$FILES"/. "$SHARE"/
+    install -Dm755 "$0" /usr/local/sbin/cmesh-byol-harden
+fi
+
+### Packages ############################################################################
+
+log "packages"
+missing=()
+for p in "${PKGS[@]}"; do pacman -Qq "$p" >/dev/null 2>&1 || missing+=("$p"); done
+if [ "${#missing[@]}" -gt 0 ]; then
+    pacman -S --noconfirm --needed "${missing[@]}" \
+        || die "pacman could not install: ${missing[*]} (on a live system run 'pacman -Syu' first, then re-run)"
+    ok "installed: ${missing[*]}"
+else
+    ok "all present: ${PKGS[*]}"
+fi
+
+### Files ###############################################################################
+
+log "configuration files"
+put() { # put <src-name> <dest> <mode>
+    local src="$FILES/$1" dst="$2" mode="$3"
+    [ -f "$src" ] || die "missing hardening file: ${src}"
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then ok "unchanged ${dst}"; return 0; fi
+    install -Dm"$mode" "$src" "$dst" && ok "installed ${dst}"
+}
+put sshd-10-cmesh-hardening.conf  /etc/ssh/sshd_config.d/10-cmesh-hardening.conf 0644
+put issue.net                     /etc/issue.net                               0644
+put nftables.conf                 /etc/nftables.conf                           0600
+put sysctl-90-cmesh-hardening.conf /etc/sysctl.d/90-cmesh-hardening.conf       0644
+put journald-50-cmesh.conf        /etc/systemd/journald.conf.d/50-cmesh.conf   0644
+put coredump-50-cmesh.conf        /etc/systemd/coredump.conf.d/50-cmesh.conf   0644
+put limits-50-cmesh-core.conf     /etc/security/limits.d/50-cmesh-core.conf    0644
+put profile-cmesh-tmout.sh        /etc/profile.d/cmesh-tmout.sh                0644
+put sudoers-10-cmesh-wheel        /etc/sudoers.d/10-cmesh-wheel                0440
+put sshguard.conf                 /etc/sshguard.conf                           0644
+put smartd.conf                   /etc/smartd.conf                             0644
+put mdmonitor-override.conf       /etc/systemd/system/mdmonitor.service.d/override.conf 0644
+put audit-50-cmesh-hipaa.rules    /etc/audit/rules.d/50-cmesh-hipaa.rules      0640
+put audit-60-cmesh-phi.rules      /etc/audit/rules.d/60-cmesh-phi.rules        0640
+put audit-99-cmesh-immutable.rules /etc/audit/rules.d/99-cmesh-immutable.rules 0640
+put cmesh-alert                   /usr/local/sbin/cmesh-alert                  0755
+put cmesh-integrity               /usr/local/sbin/cmesh-integrity              0755
+put cmesh-arch-audit              /usr/local/sbin/cmesh-arch-audit             0755
+put cmesh-integrity.service       /etc/systemd/system/cmesh-integrity.service  0644
+put cmesh-integrity.timer         /etc/systemd/system/cmesh-integrity.timer    0644
+put cmesh-integrity-init.service  /etc/systemd/system/cmesh-integrity-init.service 0644
+put cmesh-arch-audit.service      /etc/systemd/system/cmesh-arch-audit.service 0644
+put cmesh-arch-audit.timer        /etc/systemd/system/cmesh-arch-audit.timer   0644
+put pacman-cmesh-integrity.hook   /etc/pacman.d/hooks/90-cmesh-integrity.hook  0644
+
+# The sudo I/O log directory and the alert log must not be world-readable.
+install -d -m 0700 /var/log/sudo-io
+touch /var/log/sudo.log /var/log/cmesh-alerts.log; chmod 0600 /var/log/sudo.log /var/log/cmesh-alerts.log
+install -d -m 0750 /var/log/audit
+
+# sudoers: a syntax error in sudoers.d locks every admin out of root. Check or remove.
+if visudo -cf /etc/sudoers.d/10-cmesh-wheel >/dev/null; then
+    ok "sudoers.d/10-cmesh-wheel parses"
+else
+    rm -f /etc/sudoers.d/10-cmesh-wheel; die "sudoers drop-in failed visudo; removed"
+fi
+
+# auditd.conf: bigger, more rotated logs than the 8 MB x 5 default, and never suspend
+# auditing when the disk fills -- log the condition and keep rotating; the off-box
+# copy is the one that must be complete.
+log "auditd.conf"
+auditconf() { # auditconf <key> <value>
+    if grep -qE "^${1}\s*=" /etc/audit/auditd.conf; then
+        sed -i -E "s|^${1}\s*=.*|${1} = ${2}|" /etc/audit/auditd.conf
+    else
+        printf '%s = %s\n' "$1" "$2" >> /etc/audit/auditd.conf
+    fi
+}
+auditconf max_log_file 50
+auditconf num_logs 10
+auditconf max_log_file_action ROTATE
+auditconf space_left_action SYSLOG
+auditconf admin_space_left_action SYSLOG
+auditconf disk_full_action ROTATE
+auditconf disk_error_action SYSLOG
+auditconf log_format ENRICHED
+ok "auditd.conf: 10 x 50 MB, rotate, never suspend"
+
+# mdadm: route events to cmesh-alert. mdmonitor also gets --syslog via the override.
+if ! grep -qE '^PROGRAM\s+/usr/local/sbin/cmesh-alert' /etc/mdadm.conf 2>/dev/null; then
+    sed -i -E '/^(PROGRAM|MAILADDR)\s/d' /etc/mdadm.conf 2>/dev/null
+    printf 'PROGRAM /usr/local/sbin/cmesh-alert\n' >> /etc/mdadm.conf
+fi
+ok "mdadm.conf: PROGRAM /usr/local/sbin/cmesh-alert"
+
+### Kernel command line: AppArmor LSM, audit on from boot ###############################
+
+log "kernel command line"
+if [ -f /etc/default/grub ]; then
+    cur=$(sed -nE 's/^GRUB_CMDLINE_LINUX="(.*)"$/\1/p' /etc/default/grub | tail -1)
+    new="$cur"
+    for p in 'lsm=landlock,lockdown,yama,integrity,apparmor,bpf' 'audit=1' 'audit_backlog_limit=8192'; do
+        case " $new " in *" ${p%%=*}="*) ;; *) new="${new:+$new }$p" ;; esac
+    done
+    if [ "$new" != "$cur" ]; then
+        sed -i -E "s|^GRUB_CMDLINE_LINUX=\".*\"$|GRUB_CMDLINE_LINUX=\"${new}\"|" /etc/default/grub
+        ok "GRUB_CMDLINE_LINUX=\"${new}\""
+        if live && [ -f /boot/grub/grub.cfg ]; then
+            grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 && ok "grub.cfg regenerated (takes effect at next boot)" \
+                || warn "grub-mkconfig failed; AppArmor/audit cmdline not active until grub.cfg is regenerated"
+        fi
+    else
+        ok "GRUB_CMDLINE_LINUX already carries lsm= and audit="
+    fi
+else
+    warn "/etc/default/grub missing; AppArmor needs lsm=...,apparmor on the kernel command line"
+fi
+
+### Admin account and root login ########################################################
+#
+# The installer creates the admin user from the config drive's keys at install time. On
+# a server installed before that existed, this creates it from root's authorized_keys.
+# Root login over SSH is disabled only once that account has at least one key.
+
+log "admin account '${ADMIN_USER}'"
+if ! getent passwd "$ADMIN_USER" >/dev/null; then
+    if live; then
+        useradd -m -G wheel -s /bin/bash "$ADMIN_USER" && ok "created ${ADMIN_USER} (wheel, no password)"
+    else
+        ok "not created at build time; the installer creates it from the config drive"
+    fi
+fi
+if getent passwd "$ADMIN_USER" >/dev/null; then
+    usermod -aG wheel "$ADMIN_USER"
+    home=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
+    if [ ! -s "$home/.ssh/authorized_keys" ] && [ -s /root/.ssh/authorized_keys ]; then
+        install -d -m 0700 -o "$ADMIN_USER" -g "$ADMIN_USER" "$home/.ssh"
+        install -m 0600 -o "$ADMIN_USER" -g "$ADMIN_USER" /root/.ssh/authorized_keys "$home/.ssh/authorized_keys"
+        ok "copied root's authorized_keys to ${ADMIN_USER}"
+    fi
+fi
+users_conf=/etc/ssh/sshd_config.d/20-cmesh-users.conf
+home=$(getent passwd "$ADMIN_USER" 2>/dev/null | cut -d: -f6)
+if [ -n "$home" ] && [ -s "$home/.ssh/authorized_keys" ] && id -nG "$ADMIN_USER" | grep -qw wheel; then
+    printf '# Written by cmesh-byol-harden: %s has %s key(s) and is in wheel.\nPermitRootLogin no\nAllowUsers %s\n' \
+        "$ADMIN_USER" "$(grep -c . "$home/.ssh/authorized_keys")" "$ADMIN_USER" > "$users_conf"
+    ok "root SSH login disabled; AllowUsers ${ADMIN_USER}"
+else
+    rm -f "$users_conf"
+    if live; then
+        warn "no wheel user with keys -> root SSH login LEFT ENABLED. Add a key to ${home:-/home/$ADMIN_USER}/.ssh/authorized_keys and re-run."
+    else
+        ok "root login decision deferred to install time (no keys exist in the image)"
+    fi
+fi
+
+### sshd: validate, then reload ########################################################
+
+log "sshd"
+if sshd -t 2>"$LOG.sshd-t"; then
+    ok "sshd -t: configuration valid"
+    rm -f "$LOG.sshd-t"
+    live && { systemctl reload sshd 2>/dev/null && ok "sshd reloaded" || warn "sshd reload failed"; }
+else
+    cat "$LOG.sshd-t" >&2
+    rm -f /etc/ssh/sshd_config.d/10-cmesh-hardening.conf "$users_conf"
+    die "sshd rejected the hardened config; both drop-ins removed, sshd untouched"
+fi
+
+### Firewall, sysctl, audit, apparmor ##################################################
+
+log "nftables"
+if nft -c -f /etc/nftables.conf; then
+    ok "nft -c: ruleset valid"
+    live && { nft -f /etc/nftables.conf && ok "ruleset loaded" || warn "nft -f failed"; }
+else
+    die "nftables.conf failed nft -c; not loaded"
+fi
+
+log "sysctl"
+if live; then
+    sysctl -q --system >/dev/null 2>&1 && ok "sysctl --system applied" || warn "some sysctl keys failed (see sysctl --system)"
+else
+    ok "sysctl applied at boot by systemd-sysctl"
+fi
+
+log "audit rules"
+if live; then
+    if auditctl -s 2>/dev/null | grep -qE '^enabled 2'; then
+        warn "audit ruleset is immutable (-e 2) until reboot; rules on disk are updated and load at next boot"
+    elif augenrules --load >/dev/null 2>&1; then
+        ok "augenrules --load: $(auditctl -l 2>/dev/null | grep -c .) rules active"
+    else
+        warn "augenrules --load failed (is auditd running?); rules load at next boot"
+    fi
+else
+    # Merge rules.d into /etc/audit/audit.rules now (augenrules without --load only
+    # writes the file), so the image boots with the ruleset even if audit-rules.service
+    # runs before anything regenerates it.
+    augenrules >/dev/null 2>&1 || true
+    if [ -s /etc/audit/audit.rules ] && tail -1 /etc/audit/audit.rules | grep -q '^-e 2$'; then
+        ok "rules merged into /etc/audit/audit.rules; loaded by audit-rules.service at boot"
+    else
+        warn "augenrules did not produce /etc/audit/audit.rules ending in -e 2"
+    fi
+fi
+
+log "systemd units"
+systemctl daemon-reload
+for u in "${UNITS[@]}"; do
+    if systemctl enable "$u" >/dev/null 2>&1; then
+        ok "enabled ${u}"
+    else
+        warn "could not enable ${u}"
+    fi
+done
+if live; then
+    for u in nftables.service auditd.service sshguard.service smartd.service mdmonitor.service \
+             cmesh-arch-audit.timer cmesh-integrity.timer systemd-timesyncd.service; do
+        systemctl restart "$u" >/dev/null 2>&1 && ok "started ${u}" || warn "could not start ${u}: $(systemctl status "$u" 2>&1 | grep -m1 -E 'Active:|error' )"
+    done
+    # apparmor.service needs the LSM on the cmdline, which needs a reboot.
+    if grep -qw apparmor /sys/kernel/security/lsm 2>/dev/null; then
+        systemctl restart apparmor.service >/dev/null 2>&1 && ok "apparmor profiles loaded" || warn "apparmor.service failed"
+    else
+        warn "AppArmor LSM not active in this boot; reboot to activate"
+    fi
+    systemctl restart systemd-journald >/dev/null 2>&1 && ok "journald restarted (persistent, sealed)"
+    systemctl restart systemd-coredump.socket >/dev/null 2>&1 || true
+    if [ -f /var/lib/cmesh-byol/finalized ] && [ ! -f /var/lib/cmesh-byol/integrity/manifest.sha256 ]; then
+        /usr/local/sbin/cmesh-integrity init && ok "integrity baseline written"
+    fi
+fi
+
+### Done ###############################################################################
+
+log "cmesh-byol-harden complete with ${WARNINGS} warning(s)"
+if live; then
+    echo
+    echo "Next:"
+    echo "  * open a SECOND ssh session as ${ADMIN_USER} and confirm sudo works BEFORE closing this one"
+    echo "  * restrict SSH sources in /etc/nftables.conf (ssh_allowed_v4), then: nft -c -f /etc/nftables.conf && nft -f /etc/nftables.conf"
+    echo "  * journalctl --setup-keys  (store the verification key off the box)"
+    echo "  * reboot to activate AppArmor and audit=1; then: cmesh-byol-harden --status"
+fi
+[ "$WARNINGS" -eq 0 ]

@@ -1,0 +1,10 @@
+[Unit]
+Description=cmesh file-integrity check against the baseline
+Documentation=file:/usr/local/sbin/cmesh-integrity
+ConditionPathExists=/var/lib/cmesh-byol/integrity/manifest.sha256
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cmesh-integrity check
+Nice=10
+IOSchedulingClass=idle

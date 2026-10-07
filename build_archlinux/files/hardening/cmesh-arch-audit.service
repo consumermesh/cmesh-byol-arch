@@ -1,0 +1,9 @@
+[Unit]
+Description=cmesh: check installed packages against the Arch security tracker
+Documentation=https://security.archlinux.org/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cmesh-arch-audit

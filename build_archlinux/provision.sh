@@ -191,6 +191,23 @@ fi
 ln -sf /etc/systemd/system/cmesh-byol-install.service \
     /etc/systemd/system/multi-user.target.wants/cmesh-byol-install.service
 
+### Phase 4a: Hardening and monitoring ###
+
+# cmesh-byol-harden installs the packages, drop-ins, audit rules, firewall, alert sink
+# and timers that make this a HIPAA-scoped host, and enables the units. --build means:
+# touch nothing that is running in this VM. Everything lands in /etc, /usr/local and
+# /usr/share/cmesh-byol, all of which the installer rsyncs into the encrypted system.
+# The same script, without --build, applies it all to a live server (see README).
+#
+# What it does NOT do at build time is lock root out of SSH: no admin account with keys
+# exists until the installer reads the config drive, and the installer writes the
+# PermitRootLogin no drop-in itself once that account exists.
+[ -f "$FILES_SRC/cmesh-byol-harden" ] && [ -d "$FILES_SRC/hardening" ] \
+    || { echo "FATAL: ${FILES_SRC}/cmesh-byol-harden or hardening/ was not delivered" >&2; ls -la "$FILES_SRC" >&2; exit 1; }
+bash "$FILES_SRC/cmesh-byol-harden" --build --files "$FILES_SRC/hardening" \
+    || { echo "FATAL: cmesh-byol-harden --build failed; see /var/log/cmesh-byol-harden.log" >&2; exit 1; }
+echo ">>> hardening applied (cmesh-byol-harden --build)"
+
 ### Phase 4b: OVH's deploy-time hook — and the bootloader ###
 
 # /root/.ovh/make_image_bootable.sh is REQUIRED BY CONTRACT. OVH aborts the deployment

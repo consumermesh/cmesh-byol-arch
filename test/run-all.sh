@@ -22,6 +22,8 @@ for suite in "$HERE"/*.sh; do
     [ "$name" = "run-all.sh" ] && continue
     [ "$name" = "rescue-probe.sh" ] && continue            # runs on a server, not here
     [ "$name" = "post-install-probe.sh" ] && continue      # runs on a server, not here
+    # Pulls an Arch container and installs packages: minutes, not seconds. Opt in.
+    [ "$name" = "hardening-container-test.sh" ] && [ "${CMESH_CONTAINER_TESTS:-0}" != 1 ] && continue
     RAN=$((RAN + 1))
     printf '\n############ %s ############\n' "$name"
     if bash "$suite"; then

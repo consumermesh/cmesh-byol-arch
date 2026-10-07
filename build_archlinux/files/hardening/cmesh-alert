@@ -1,0 +1,40 @@
+#!/bin/bash
+# cmesh-alert — the one place every monitor on this host reports to.
+#
+# Usage: cmesh-alert <source> <message...>      (also reads the message from stdin)
+#
+# mdadm (PROGRAM in mdadm.conf), smartd (-M exec), the arch-audit timer, and the
+# integrity timer all call this. It writes the alert to the journal at priority err with
+# SYSLOG_IDENTIFIER=cmesh-alert, and appends it to /var/log/cmesh-alerts.log.
+#
+# To get alerts OFF the box, add a delivery here (webhook, mail, pager) or alert on the
+# identifier from your log collector: `journalctl -t cmesh-alert -p err`.
+set -u
+LOG="${CMESH_ALERT_LOG:-/var/log/cmesh-alerts.log}"
+
+# mdadm calls PROGRAM with: <event> <md device> [<component device>]
+# smartd calls -M exec with the message in SMARTD_MESSAGE and details in the environment.
+if [ -n "${SMARTD_MESSAGE:-}" ]; then
+    src=smartd
+    msg="${SMARTD_MESSAGE} (${SMARTD_DEVICE:-?} ${SMARTD_FAILTYPE:-})"
+elif [ -n "${MDADM_EVENT:-}" ] || [ "${1:-}" = "--mdadm" ]; then
+    src=mdadm
+    [ "${1:-}" = "--mdadm" ] && shift
+    msg="$*"
+else
+    src="${1:-unknown}"; shift || true
+    if [ $# -gt 0 ]; then msg="$*"; else msg=$(cat); fi
+fi
+
+# mdadm's own invocation has no env var; detect it by the argument shape instead:
+# first word is an mdadm event name (DegradedArray, Fail, ...), second is /dev/md*.
+case "${src}" in
+    DegradedArray|DeviceDisappeared|Fail|FailSpare|MoveSpare|NewArray|RebuildFinished|RebuildStarted|Rebuild[0-9]*|SpareActive|SparesMissing|TestMessage)
+        msg="${src} ${msg}"; src=mdadm ;;
+esac
+
+stamp=$(date -Is)
+line="${stamp} [${src}] ${msg}"
+logger -p daemon.err -t cmesh-alert -- "[${src}] ${msg}"
+{ umask 077; printf '%s\n' "$line" >> "$LOG"; } 2>/dev/null
+exit 0

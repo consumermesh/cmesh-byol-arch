@@ -1,0 +1,13 @@
+## cmesh BYOL hardening — /etc/audit/rules.d/60-cmesh-phi.rules
+##
+## Access to protected health information. HIPAA wants a record of who READ it, not
+## only who changed it. Point these at wherever the application keeps PHI (a database
+## directory, an uploads tree, a mount). The defaults watch /srv and /home for writes
+## and attribute changes only; a read watch (-p r) on a busy directory is a firehose,
+## so add it per directory once you know the volume.
+##
+## Examples:
+##   -w /srv/app/uploads -p rwa -k phi
+##   -w /var/lib/postgres/data -p wa -k phi
+-w /srv/ -p wa -k phi
+-w /home/ -p wa -k phi

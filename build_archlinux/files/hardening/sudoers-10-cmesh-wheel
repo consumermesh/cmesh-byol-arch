@@ -1,0 +1,13 @@
+# cmesh BYOL hardening — /etc/sudoers.d/10-cmesh-wheel
+#
+# Admin accounts are key-only and have no password, so sudo cannot ask for one.
+# Every sudo command is logged to the journal (and to auditd via the execve rules)
+# with the invoking user's name — that is the individual accountability a shared root
+# login cannot give.
+Defaults use_pty
+Defaults logfile=/var/log/sudo.log
+Defaults log_input, log_output
+Defaults iolog_dir=/var/log/sudo-io
+Defaults lecture=never
+Defaults timestamp_timeout=5
+%wheel ALL=(ALL:ALL) NOPASSWD: ALL

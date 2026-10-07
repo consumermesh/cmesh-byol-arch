@@ -288,6 +288,9 @@ users:
 # CHANGE THIS. It must be identical on both LUKS keyslots to be usable as a rescue
 # passphrase for either disk.
 cmesh_luks_passphrase: "CHANGE-ME-long-random-passphrase"
+# Optional. The key-only sudo account the installed system gets; root SSH login is
+# turned off once it exists. Default: admin.
+cmesh_admin_user: admin
 ```
 
 Generate it with something that is not your shell history:
@@ -415,6 +418,67 @@ systemctl reboot
 # after it returns, without a passphrase:
 cryptsetup status cryptroot0 | head -3
 ```
+
+## Hardening and monitoring
+
+Encryption at rest is one HIPAA safeguard. The rest — access control, audit controls,
+integrity, automatic logoff, authentication — is applied by
+`build_archlinux/files/cmesh-byol-harden` with the files under
+`build_archlinux/files/hardening/`. provision.sh runs it at build time (`--build`), so
+every image carries it, and the installer copies the result into the encrypted system.
+The same script, without `--build`, applies it to a server that is already running.
+
+What it puts in place:
+
+| Control | How |
+|---|---|
+| Named admin account, no shared root login | The installer creates `admin` (or `cmesh_admin_user:` from the cloud-config) in `wheel`, gives it the config drive's SSH keys, then writes `PermitRootLogin no` + `AllowUsers admin` — only after the keys are confirmed in place. sudo is NOPASSWD (there are no passwords) and logs every command and its I/O. |
+| SSH hardening | `sshd_config.d/10-cmesh-hardening.conf`: keys only, 3 tries, 10-minute idle logoff, no forwarding, pre-auth banner (`/etc/issue.net`), modern ciphers, VERBOSE logging (key fingerprint per login). |
+| Firewall | nftables, default deny inbound, SSH rate-limited from `ssh_allowed_v4` — **edit it** in `/etc/nftables.conf` to your management addresses. SSH over IPv6 is off by default (commented rules to enable). sshguard bans brute-forcers into its own nft set. |
+| Audit trail | auditd with `rules.d/50-cmesh-hipaa.rules`: identity files, sudo, every command run as root by a logged-in user (`-k rootcmd`), the boot path, LUKS/mdadm tools, firewall, modules, mounts, time, failed access. `60-cmesh-phi.rules` watches `/srv` and `/home`; point it at where the PHI lives. `99-…` makes the set immutable until reboot. |
+| Logs | journald persistent, compressed, sealed (run `journalctl --setup-keys` once), bounded to 512 MB. auditd 10 × 50 MB, rotates, never suspends. |
+| Kernel | sysctl: kptr/dmesg restriction, no SysRq, no forwarding, rp_filter, no redirects, syncookies. AppArmor on the kernel command line and `apparmor.service` enabled. No core dumps anywhere (coredump.conf + hard ulimit). |
+| Shell | `TMOUT=900` read-only in login shells. |
+| Hardware | `mdmonitor` (with `--syslog`) and `smartd` (daily short, weekly long self-test) report through `cmesh-alert`. |
+| Vulnerabilities | `cmesh-arch-audit.timer` checks installed packages against the Arch security tracker daily; packages with an available fix raise an alert. Arch has no security-only channel: **schedule `pacman -Syu` and a reboot window.** |
+| File integrity | `cmesh-integrity`: daily `pacman -Qkk` plus a sha256 manifest of `/etc`, `/boot`, `/usr/local`, unit files and SSH keys, against a baseline taken after finalize. A pacman hook re-baselines after each transaction so upgrades do not alert. |
+| Alerts | Everything above calls `/usr/local/sbin/cmesh-alert`, which writes to the journal (`-t cmesh-alert`, priority err) and `/var/log/cmesh-alerts.log`. Add your delivery there, or alert on the identifier from your collector. |
+
+### On a server that is already installed
+
+No reinstall. Copy the script and its files, run it as root, and keep that session open
+until you have confirmed a second one works:
+
+```bash
+scp -r build_archlinux/files/cmesh-byol-harden build_archlinux/files/hardening root@HOST:/tmp/
+ssh root@HOST
+/tmp/cmesh-byol-harden --files /tmp/hardening     # add --admin-user NAME to not use "admin"
+```
+
+It creates the admin account from root's `authorized_keys`, validates the sshd config
+with `sshd -t` before reloading (and removes its own drop-ins if that fails), checks the
+firewall with `nft -c` before loading it (established connections are accepted first, so
+your session survives), and prints what still needs a reboot (AppArmor, `audit=1`).
+Then, **in a second terminal**: `ssh admin@HOST sudo -n true`. Only when that works,
+close the first.
+
+A copy is kept at `/usr/share/cmesh-byol/hardening`, so later re-runs are just
+`cmesh-byol-harden` after editing a file there. `cmesh-byol-harden --status` reports
+every control without changing anything.
+
+### What the script cannot do for you
+
+- **Secure Boot.** The TPM seal is bound to PCR 7 only. With Secure Boot off, PCR 7 is
+  the same for any OS booted on the machine, so the encryption protects a pulled drive
+  but not the box itself. Check `bootctl status`; the fix is your own Secure Boot keys
+  (sbctl), a signed unified kernel image, and binding to PCRs 7+11.
+- **Logs off the box.** Local retention is bounded by the 8 GiB root. Ship the journal
+  (`systemd-journal-upload`, or any collector) to storage you control, with the
+  retention your policy names. The audit log is the record an auditor asks for.
+- **SSH source addresses**, the PHI paths in `60-cmesh-phi.rules`, and alert delivery in
+  `cmesh-alert` are placeholders until you fill them in.
+- **Backups**, a Business Associate Agreement with the provider, the risk analysis, and
+  access reviews — paperwork, not packages.
 
 ## Backing up the LUKS headers
 

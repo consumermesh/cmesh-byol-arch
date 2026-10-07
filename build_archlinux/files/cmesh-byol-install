@@ -245,6 +245,7 @@ read_passphrase() {
     # initialise them here.
     LUKS_PASSPHRASE=""
     CMESH_SSH_KEYS=""
+    CMESH_ADMIN_USER=""
 
     local ud seen=""
     for dev in $(config_drive_devices); do
@@ -277,6 +278,10 @@ read_passphrase() {
                     }
                 ' "$ud")
                 # CMESH-SSH-KEY-PARSER-END
+                # Optional: the name of the key-only admin account the installed system
+                # gets (default "admin"). Root's SSH login is disabled once it exists.
+                CMESH_ADMIN_USER=$(grep -E '^[[:space:]]*cmesh_admin_user:' "$ud" \
+                    | tail -1 | sed -E 's/^[^:]*:[[:space:]]*//; s/^["'"'"']//; s/["'"'"']$//')
             else
                 warn "config drive ${dev} has no user data in any known layout"
             fi
@@ -297,6 +302,11 @@ read_passphrase() {
         "cmesh_luks_passphrase is too short (${#LUKS_PASSPHRASE} chars); use at least 12"
 
     log "passphrase read from the config drive (${#LUKS_PASSPHRASE} chars)"
+
+    CMESH_ADMIN_USER="${CMESH_ADMIN_USER:-admin}"
+    printf '%s' "$CMESH_ADMIN_USER" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$' \
+        || die "cmesh_admin_user '${CMESH_ADMIN_USER}' is not a valid account name"
+    [ "$CMESH_ADMIN_USER" != root ] || die "cmesh_admin_user must not be root"
 
     if [ -n "$CMESH_SSH_KEYS" ]; then
         log "SSH keys read from the config drive: $(printf '%s\n' "$CMESH_SSH_KEYS" | grep -c . )"
@@ -650,6 +660,44 @@ scrub_config_drive() {
     done
 }
 
+install_admin_user() {
+    # A named, key-only, sudo-capable account; then root is closed to SSH.
+    #
+    # HIPAA wants every action attributable to a person (unique user identification,
+    # 164.312(a)(2)(i)); a shared root login is the opposite of that. The account is
+    # created in the target, gets the SAME keys as root (so the operator's existing key
+    # works unchanged), and is in wheel, which the hardening's sudoers drop-in grants
+    # NOPASSWD sudo -- there is no password to ask for. Only once the keys are in place
+    # is the sshd drop-in written that turns root login off: a failure anywhere above
+    # leaves root reachable rather than nobody.
+    #
+    # The same drop-in is written by cmesh-byol-harden on a live server; this is the
+    # install-time path so a fresh deployment never has root open over SSH at all.
+    local u="$CMESH_ADMIN_USER" home
+    if ! chroot "$MNT" getent passwd "$u" >/dev/null 2>&1; then
+        chroot "$MNT" useradd -m -G wheel -s /bin/bash "$u" \
+            || { warn "could not create admin user ${u}; root SSH login stays enabled"; return 0; }
+        log "created admin user ${u} (wheel, no password)"
+    else
+        chroot "$MNT" usermod -aG wheel "$u" || true
+    fi
+    home=$(chroot "$MNT" getent passwd "$u" | cut -d: -f6)
+    [ -n "$home" ] || { warn "no home for ${u}; root SSH login stays enabled"; return 0; }
+    install -d -m 0700 "$MNT$home/.ssh"
+    printf '%s\n' "$CMESH_SSH_KEYS" > "$MNT$home/.ssh/authorized_keys"
+    chmod 0600 "$MNT$home/.ssh/authorized_keys"
+    chroot "$MNT" chown -R "$u:$u" "$home/.ssh"
+    [ -s "$MNT$home/.ssh/authorized_keys" ] \
+        || { warn "${u} has no keys; root SSH login stays enabled"; return 0; }
+    # CMESH-ROOT-LOGIN-OFF
+    install -Dm644 /dev/stdin "$MNT/etc/ssh/sshd_config.d/20-cmesh-users.conf" <<EOF
+# Written by cmesh-byol-install: ${u} has $(grep -c . "$MNT$home/.ssh/authorized_keys") key(s) and is in wheel.
+PermitRootLogin no
+AllowUsers ${u}
+EOF
+    log "root SSH login disabled on the installed system; log in as ${u} and use sudo"
+}
+
 install_ssh_keys() {
     # Write the keys read from the config drive, and enable sshd.
     #
@@ -671,6 +719,7 @@ install_ssh_keys() {
         printf '%s\n' "$CMESH_SSH_KEYS" > "$MNT/root/.ssh/authorized_keys"
         chmod 0600 "$MNT/root/.ssh/authorized_keys"
         log "authorized_keys: $(grep -c . "$MNT/root/.ssh/authorized_keys") key(s)"
+        install_admin_user
     else
         warn "no SSH keys to install; log in over the OVHcloud KVM console instead"
     fi

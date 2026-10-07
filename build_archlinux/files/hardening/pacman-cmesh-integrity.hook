@@ -1,0 +1,15 @@
+# /etc/pacman.d/hooks/90-cmesh-integrity.hook
+# Re-baseline after every package transaction so upgrades do not raise integrity alerts.
+# The transaction itself is in /var/log/pacman.log and in the journal (auditd key:
+# packages), which is the record of what changed and who ran it.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Re-baselining cmesh file integrity after the package transaction...
+When = PostTransaction
+Exec = /usr/local/sbin/cmesh-integrity accept
