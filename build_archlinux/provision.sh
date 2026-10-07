@@ -43,7 +43,7 @@ pacman -S --noconfirm --needed \
 # discovering it on a customer's server with the disks already wiped.
 for tool in cryptsetup mdadm sgdisk mkfs.ext4 mkfs.vfat rsync tar zstd \
             systemd-cryptenroll grub-install grub-mkconfig mkinitcpio blkid findmnt \
-            mkswap fallocate chattr sshd; do
+            mkswap fallocate chattr sshd lsinitcpio wipefs; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "FATAL: required tool '$tool' is missing from the image" >&2
         exit 1
@@ -196,7 +196,7 @@ ln -sf /etc/systemd/system/cmesh-byol-install.service \
 # the script at all. Read the hook's own log first when a deployment does not boot -- it is
 # written to the deployed root and survives the reboot:
 #
-#   mount /dev/md3 /mnt && cat /mnt/var/log/ovh-make-bootable.log
+#   mdadm --assemble --scan; mount <the array that was /> /mnt && cat /mnt/var/log/ovh-make-bootable.log
 #
 # The hook deliberately does NOT touch the partition layout: it runs before the first
 # reboot, while the layout OVH just created is still the one cmesh-byol-install replaces.
@@ -249,7 +249,7 @@ cat > /root/.ovh/make_image_bootable.sh <<'HOOK'
 # is written to the DEPLOYED ROOT (not the ESP, which cmesh-byol-install formats again) and
 # survives the reboot, so it can be read from rescue mode:
 #
-#   mount /dev/md3 /mnt && cat /mnt/var/log/ovh-make-bootable.log
+#   mdadm --assemble --scan; mount <the array that was /> /mnt && cat /mnt/var/log/ovh-make-bootable.log
 #
 # Read it FIRST when a deployment does not boot. Two rounds of this project were spent
 # guessing at a failure this log names outright.

@@ -1,0 +1,27 @@
+{
+  "operatingSystem": "byolinux_64",
+  "storage": [
+    {
+      "diskGroupId": 1,
+      "hardwareRaid": [],
+      "partitioning": {
+        "disks": 2,
+        "layout": [
+          { "fileSystem": "ext4", "mountPoint": "/boot", "size": 1024, "raidLevel": 1, "extras": {} },
+          { "fileSystem": "ext4", "mountPoint": "/",     "size": 8192, "raidLevel": 1, "extras": {} },
+          { "fileSystem": "ext4", "mountPoint": "/data", "size": 0,    "raidLevel": 1, "extras": {} }
+        ]
+      }
+    }
+  ],
+  "customizations": {
+    "hostname": "cmesh-hipaa",
+    "sshKey": "ssh-ed25519 AAAA... you@workstation",
+    "imageURL": "https://github.com/consumermesh/cmesh-byol-arch/releases/download/<tag>/archlinux.qcow2",
+    "imageCheckSum": "<sha512 from the release>",
+    "imageCheckSumType": "sha512",
+    "configDriveUserData": "<base64 of the cloud-config in the README>",
+    "enableLacpBonding": false,
+    "efiBootloaderPath": "\\EFI\\BOOT\\BOOTX64.EFI"
+  }
+}

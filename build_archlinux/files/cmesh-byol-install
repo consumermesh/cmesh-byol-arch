@@ -1,18 +1,40 @@
 #!/bin/bash
 # cmesh-byol-install — first-boot encrypted install for OVHcloud bare metal.
 #
-# Runs ONCE, from the freshly-deployed BYOL image, and rebuilds both disks as:
+# Runs ONCE, from the freshly-deployed BYOL image, and turns the layout OVHcloud built
+# into this:
 #
-#   p1  512M vfat      ESP (per disk, both bootable)
-#   p2    1G linux-raid ─┐
-#                        ├─ md2 (raid1, ext4) → /boot        [unencrypted, GRUB reads it]
-#   p3  rest  LUKS2 ─┐   │
-#      cryptrootN ───┴───┴─ md3 (raid1, ext4) → /           [encrypted]
+#   nvme0n1                                  nvme1n1
+#   ├─p1  ESP  vfat  /boot/efi               ├─p1  ESP  vfat   (loader mirrored by the hook)
+#   ├─p2  ─┐ md (raid1, ext4) → /boot        ├─p2  ─┘          [unencrypted, GRUB reads it]
+#   ├─p3  ─┐ md (raid1, ext4) → bootstrap /  ├─p3  ─┘          [dormant after the install]
+#   └─p4  LUKS2 ─┐                           └─p4  LUKS2 ─┐
+#        cryptroot0 ─┴─ md/cmeshroot (raid1, ext4) → /  ─┴─ cryptroot1   [encrypted]
+#
+# OVHcloud's partitioner creates every partition above. It is asked (deploy.json) for
+# /boot, a small / for this bootstrap system, and a large third RAID1 partition mounted
+# at /data. THAT PARTITION IS THE PAYLOAD: nothing runs from it, so it is the one thing
+# on these disks that can be destroyed and rebuilt while the machine is up.
+#
+# WHY NOT REPARTITION THE DISKS
+#
+# The previous design wiped both disks and re-created every partition from a running
+# system whose root was on those very disks. Linux does not allow that: the kernel will
+# not reload a partition table while any partition is held open, and the bootstrap's
+# md arrays hold them. wipefs/sgdisk fail with EBUSY, or write a GPT the kernel ignores,
+# and every later step then operates on the OLD partitions — which are busy. Staging the
+# rootfs in tmpfs changes nothing, because nothing ever pivoted off the old root.
+#
+# Taking the layout from the deployer instead means: the partition table is never
+# touched; /boot and the ESPs are shared with the bootstrap and already carry a working
+# GRUB (installed by the deploy hook, which is the only place OVHcloud lets one be
+# installed); and the bootstrap root stays intact as a rescue environment until the
+# first encrypted boot has been verified.
 #
 # LUKS sits UNDER the RAID, one header per disk, so a disk failure costs a disk rather
 # than the array. See README for why that ordering is not negotiable.
 #
-# THIS DESTROYS BOTH DISKS. That is its purpose.
+# THIS DESTROYS THE PAYLOAD PARTITION. The bootstrap root, /boot and the ESPs survive.
 #
 # Every precondition is checked before anything destructive happens, and the completion
 # marker is written only at the very end, so a failure is re-runnable and diagnosable
@@ -22,30 +44,22 @@ set -euo pipefail
 
 readonly MARKER=/var/lib/cmesh-byol/installed
 readonly WORKDIR=/run/cmesh-byol
-readonly ROOTFS_TAR="$WORKDIR/rootfs.tar.zst"
 readonly MNT=/mnt/cmesh-target
 readonly LOG=/var/log/cmesh-byol-install.log
-readonly MIN_MEM_MIB=8192
-# 1 GiB. Measured on an equivalent OVH Arch host, /boot holds 71 MiB in total
-# (intel-ucode 15M, initramfs 20M, vmlinuz 17M, grub 19M, amd-ucode 0.3M) with one
-# kernel installed and the stock mkinitcpio preset using PRESETS=('default'), so no
-# fallback image is built. That is ~8% of this partition, ~12% transiently while a
-# kernel upgrade has both versions on disk — comfortably enough. OVH provision the same
-# target at 988 MiB, so this is slightly more than the layout it replaces.
-#
-# If you later add linux-lts as a second independently bootable kernel, re-check this:
-# two kernels plus their images roughly doubles the 37 MiB per-kernel cost, which is
-# still fine here, but it is the change that would eventually matter.
-readonly BOOT_MIB=1024
-readonly ESP_MIB=512
+# Where deploy.json asks OVHcloud to mount the payload partition. Everything below finds
+# the partition through this mount, never by a hardcoded device name.
+readonly DATA_MOUNT=/data
+# The encrypted root array. Named rather than numbered: md NUMBERS are not stable, and
+# the bootstrap's own arrays already occupy the low ones.
+readonly ROOT_MD_NAME=cmeshroot
+readonly ROOT_MD=/dev/md/cmeshroot
 readonly LUKS_KEY=/boot/cmesh-luks.key
-readonly POOL_NAME=md3
 # How long to wait for the config-drive partition to be enumerated before giving up and
 # reporting. Not a dependency on anything -- see wait_for_config_drive().
 readonly CONFIG_DRIVE_TIMEOUT_SEC=60
 
-# Duplicated to the serial console so a failed install is readable over KVM, where the
-# filesystem is about to be destroyed and journald may never flush.
+# Duplicated to the serial console so a failed install is readable over KVM, where
+# journald may never flush.
 exec > >(tee -a "$LOG" /dev/console) 2>&1
 
 log()  { printf '\n=== %s\n' "$*"; }
@@ -64,56 +78,86 @@ check_already_done() {
 
 check_arch() {
     [ -f /etc/arch-release ] || die "not an Arch system (/etc/arch-release missing)"
-}
-
-check_memory() {
-    local mem_mib
-    mem_mib=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo)
-    log "RAM: ${mem_mib} MiB"
-    # The rootfs is staged in /run (tmpfs) while the disks are destroyed, so this is a
-    # hard floor, not a recommendation.
-    [ "$mem_mib" -ge "$MIN_MEM_MIB" ] \
-        || die "need >= ${MIN_MEM_MIB} MiB RAM to stage the rootfs in tmpfs (have ${mem_mib})"
     findmnt -no FSTYPE /run | grep -q tmpfs \
-        || die "/run is not tmpfs; there is nowhere safe to stage the rootfs"
-}
-
-check_disks() {
-    # Exactly two whole disks, equal size, no partitions mounted from them. Refusing on
-    # anything else is deliberate: this script partitions everything it finds.
-    mapfile -t DISKS < <(lsblk -dno NAME,TYPE | awk '$2 == "disk" {print "/dev/"$1}' | sort)
-    DISK_COUNT=${#DISKS[@]}
-    log "whole disks detected: ${DISK_COUNT} (${DISKS[*]:-none})"
-    [ "$DISK_COUNT" -eq 2 ] \
-        || die "expected exactly 2 whole disks, found ${DISK_COUNT} — refusing to partition"
-
-    local s0 s1
-    s0=$(blockdev --getsize64 "${DISKS[0]}")
-    s1=$(blockdev --getsize64 "${DISKS[1]}")
-    log "sizes: ${DISKS[0]}=${s0} ${DISKS[1]}=${s1}"
-    [ "$s0" -eq "$s1" ] \
-        || die "disks differ in size (${s0} vs ${s1}); RAID1 needs matching members"
-
-    # Bail if anything from these disks is mounted — partitioning a live member is how
-    # you corrupt the system you are running from.
-    local d mnt
-    for d in "${DISKS[@]}"; do
-        while read -r mnt; do
-            [ -n "$mnt" ] || continue
-            case "$mnt" in
-                /|/boot|/boot/efi) continue ;;   # the bootstrap's own mounts
-                *) die "${d} has a mounted partition at ${mnt}; unmount before installing" ;;
-            esac
-        done < <(lsblk -no MOUNTPOINT "$d" | grep -v '^$' || true)
-    done
+        || die "/run is not tmpfs; there is nowhere safe to hold the temporary LUKS key"
 }
 
 check_tools() {
     local t
-    for t in cryptsetup mdadm sgdisk mkfs.ext4 mkfs.vfat rsync tar zstd \
-             blkid findmnt grub-install grub-mkconfig mkinitcpio; do
+    for t in cryptsetup mdadm wipefs mkfs.ext4 rsync blkid findmnt lsblk \
+             grub-mkconfig mkinitcpio lsinitcpio mkswap fallocate; do
         command -v "$t" >/dev/null 2>&1 || die "required tool missing: $t"
     done
+}
+
+check_layout() {
+    # The deployer must have produced the layout deploy.json asks for. Each of these is
+    # checked by what is MOUNTED, because that is what the deployer actually did; the
+    # partition table is only consulted to confirm the members.
+    #
+    # Sets: PAYLOAD_MD, MEMBERS[] (one partition per disk), DISKS[].
+    log "checking the layout OVHcloud built"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT | sed 's/^/    /'
+
+    # /boot must be its own filesystem: the installed system shares it with the
+    # bootstrap, and the kernel, initramfs and grub.cfg all live there.
+    mountpoint -q /boot \
+        || die "/boot is not a separate filesystem; deploy.json must request a /boot partition"
+    mountpoint -q /boot/efi \
+        || die "/boot/efi is not mounted; the deployer did not mount the ESP"
+
+    # The payload.
+    PAYLOAD_MD=$(findmnt -no SOURCE "$DATA_MOUNT" 2>/dev/null || true)
+    [ -n "$PAYLOAD_MD" ] || die \
+        "nothing is mounted at ${DATA_MOUNT}. deploy.json must request a RAID1 partition with mountPoint ${DATA_MOUNT} (size 0 = the rest of the disk)."
+    PAYLOAD_MD=$(readlink -f "$PAYLOAD_MD")
+    case "$(lsblk -dno TYPE "$PAYLOAD_MD")" in
+        raid1) ;;
+        *) die "${PAYLOAD_MD} (${DATA_MOUNT}) is not a raid1 md array; refusing" ;;
+    esac
+
+    # The partition the running system is on must not be the payload.
+    local root_src
+    root_src=$(readlink -f "$(findmnt -no SOURCE /)")
+    [ "$root_src" != "$PAYLOAD_MD" ] || die "/ is on the payload array ${PAYLOAD_MD}; the layout is wrong"
+
+    # Members: exactly one partition per disk, on two different disks, equal size.
+    mapfile -t MEMBERS < <(lsblk -nro NAME,TYPE -s "$PAYLOAD_MD" | awk '$2 == "part" {print "/dev/"$1}' | sort)
+    log "payload array: ${PAYLOAD_MD} with members: ${MEMBERS[*]:-none}"
+    [ "${#MEMBERS[@]}" -eq 2 ] \
+        || die "expected exactly 2 members in ${PAYLOAD_MD}, found ${#MEMBERS[@]}"
+
+    DISKS=()
+    local m disk
+    for m in "${MEMBERS[@]}"; do
+        disk=$(lsblk -no PKNAME "$m" | head -1)
+        [ -n "$disk" ] || die "cannot determine the parent disk of ${m}"
+        DISKS+=("/dev/$disk")
+    done
+    [ "${DISKS[0]}" != "${DISKS[1]}" ] \
+        || die "both members of ${PAYLOAD_MD} are on ${DISKS[0]}; that is not a mirror"
+
+    local s0 s1
+    s0=$(blockdev --getsize64 "${MEMBERS[0]}")
+    s1=$(blockdev --getsize64 "${MEMBERS[1]}")
+    log "member sizes: ${MEMBERS[0]}=${s0} ${MEMBERS[1]}=${s1}"
+    [ "$s0" -eq "$s1" ] || die "members differ in size; RAID1 needs matching members"
+
+    # Nothing but the payload array may hold these partitions. If anything else does,
+    # destroying them would take it down too.
+    local holder holders
+    for m in "${MEMBERS[@]}"; do
+        holders=$(ls "/sys/class/block/$(basename "$m")/holders" 2>/dev/null || true)
+        for holder in $holders; do
+            [ "/dev/$holder" = "$PAYLOAD_MD" ] \
+                || die "${m} is also held by /dev/${holder}; refusing to destroy it"
+        done
+        if findmnt -rn -S "$m" >/dev/null 2>&1; then
+            die "${m} is mounted directly; refusing"
+        fi
+    done
+
+    log "layout OK: payload is ${PAYLOAD_MD} over ${MEMBERS[*]}; bootstrap root is ${root_src}"
 }
 
 config_drive_devices() {
@@ -224,149 +268,124 @@ read_passphrase() {
     fi
 }
 
-### Stage the rootfs ################################################################
+### Release and encrypt the payload #################################################
 
-stage_rootfs() {
-    log "staging the running rootfs into ${ROOTFS_TAR}"
+release_payload() {
+    # Hand the payload partitions back: unmount, forget the mount, stop the array, and
+    # erase every signature so nothing re-assembles or re-mounts the old array.
+    log "releasing ${PAYLOAD_MD} (${DATA_MOUNT}) — DESTRUCTIVE from here"
 
-    mkdir -p "$WORKDIR"
-    rm -f "$ROOTFS_TAR"
+    umount "$DATA_MOUNT" \
+        || die "could not unmount ${DATA_MOUNT}; something is using it"
 
-    # Exclude virtual filesystems and anything we recreate afterwards. /boot is excluded
-    # because it is a separate unencrypted array in the target layout, and /var/lib/
-    # cmesh-byol because the marker must NOT be carried across (the installed system has
-    # its own, written at the end).
-    tar --one-file-system \
-        --exclude=./proc/*      --exclude=./sys/*       --exclude=./dev/* \
-        --exclude=./run/*       --exclude=./tmp/*       --exclude=./mnt/* \
-        --exclude=./media/*     --exclude=./boot/*      --exclude=./lost+found \
-        --exclude=./var/lib/cmesh-byol \
-        --exclude=./var/log/cmesh-byol-install.log \
-        -C / -cf - . | zstd -T0 -3 -o "$ROOTFS_TAR"
+    # The bootstrap's fstab lists the payload mount. The array is about to stop existing,
+    # and this fstab stays on the dormant bootstrap root: if that system is ever booted
+    # again, a missing non-nofail mount would hang it in emergency mode.
+    if [ -f /etc/fstab ]; then
+        awk -v m="$DATA_MOUNT" '$2 != m' /etc/fstab > /run/cmesh-byol.fstab
+        cat /run/cmesh-byol.fstab > /etc/fstab
+        rm -f /run/cmesh-byol.fstab
+        systemctl daemon-reload || true
+    fi
 
-    local size
-    size=$(du -h "$ROOTFS_TAR" | cut -f1)
-    log "staged rootfs: ${size}"
-    [ -s "$ROOTFS_TAR" ] || die "rootfs tarball is empty"
-}
+    mdadm --stop "$PAYLOAD_MD"
+    udevadm settle
 
-### Partition + encrypt #############################################################
-
-partition_disks() {
-    log "partitioning ${DISKS[*]} — DESTRUCTIVE from here"
-
-    local d
-    for d in "${DISKS[@]}"; do
-        # Drop any existing md superblocks first: leftover metadata on a member makes
-        # assembly pick up the old array.
-        mdadm --zero-superblock "${d}"p2 2>/dev/null || true
-        mdadm --zero-superblock "${d}"p3 2>/dev/null || true
-        wipefs -a "$d"
-        sgdisk --zap-all "$d"
-        sgdisk -n "1:1MiB:+${ESP_MIB}MiB" -t 1:ef00 -c 1:ESP  "$d"
-        sgdisk -n "2:0:+${BOOT_MIB}MiB"   -t 2:fd00 -c 2:boot "$d"
-        sgdisk -n "3:0:0"                 -t 3:8309 -c 3:cryptroot "$d"
-        partprobe "$d" 2>/dev/null || blockdev --rereadpt "$d"
-        udevadm settle
+    local m
+    for m in "${MEMBERS[@]}"; do
+        # The md superblock sits 4 KiB into the partition. Leaving it would make udev's
+        # incremental assembly rule pick the partition up as a RAID member again.
+        mdadm --zero-superblock "$m"
+        wipefs -a "$m"
     done
-}
+    udevadm settle
 
-create_boot_array() {
-    # BOTH ESPs must be formatted. Only DISKS[1]p1 ever was, which left DISKS[0]p1 with no
-    # filesystem at all: install_grub mounts it and points grub-install at it, and the
-    # /boot/efi fstab entry was generated with an empty UUID because blkid had nothing to
-    # read. The partitions are brand new and empty here, so this is safe and idempotent.
-    for d in "${DISKS[@]}"; do
-        mkfs.vfat -F32 -n EFI_SYSPART "${d}p1"
-        log "formatted ESP ${d}p1"
+    # Prove they are free before formatting them.
+    for m in "${MEMBERS[@]}"; do
+        [ -z "$(ls "/sys/class/block/$(basename "$m")/holders" 2>/dev/null)" ] \
+            || die "${m} still has a holder after the array was stopped"
     done
+    [ ! -e "$PAYLOAD_MD" ] || die "${PAYLOAD_MD} still exists after mdadm --stop"
 
-    log "creating ${POOL_NAME%3}2 (/boot, raid1, unencrypted)"
-    mdadm --create /dev/md2 --level=1 --raid-devices=2 --metadata=1.2 \
-        --name=boot --run "${DISKS[0]}p2" "${DISKS[1]}p2"
-    mkfs.ext4 -q -L boot /dev/md2
+    # The partition type GUID stays whatever the deployer set (Linux RAID). It is not
+    # changed on purpose: rewriting the GPT of a live disk is exactly the operation this
+    # design exists to avoid, and the kernel does not consult the type for anything.
+    log "payload partitions released: ${MEMBERS[*]}"
 }
 
 create_encrypted_root() {
     log "creating LUKS2 containers (one header per disk)"
 
     local keyfile=$1
-    local i=0 d
-    for d in "${DISKS[@]}"; do
+    local i=0 m
+    for m in "${MEMBERS[@]}"; do
         # aes-xts-plain64 with a 512-bit key is AES-256-XTS. argon2id is the LUKS2
         # default and is correct — do not tune it down.
         cryptsetup luksFormat --type luks2 \
             --cipher aes-xts-plain64 --key-size 512 \
             --hash sha256 --pbkdf argon2id \
-            --batch-mode "$d"p3 "$keyfile"
+            --batch-mode "$m" "$keyfile"
 
         # The operator passphrase is a SECOND keyslot, so it survives as the rescue path
-        # after the temporary keyfile is deleted at finalize.
-        cryptsetup luksAddKey "$d"p3 "$keyfile" --key-file "$keyfile" \
-            --batch-mode --new-keyfile <(printf '%s' "$LUKS_PASSPHRASE")
+        # after the temporary keyfile is deleted at finalize. No trailing newline: what
+        # is typed at a passphrase prompt later has to match byte for byte.
+        cryptsetup luksAddKey --key-file "$keyfile" --batch-mode \
+            "$m" <(printf '%s' "$LUKS_PASSPHRASE")
 
-        cryptsetup open "$d"p3 "cryptroot${i}" --key-file "$keyfile"
+        cryptsetup open "$m" "cryptroot${i}" --key-file "$keyfile"
         udevadm settle
         i=$((i + 1))
     done
 
-    log "creating ${POOL_NAME} (/, raid1 over the dm-crypt mappings)"
+    log "creating ${ROOT_MD} (/, raid1 over the dm-crypt mappings)"
     # The members are dm-crypt devices, NOT the raw partitions — this is the whole point.
-    mdadm --create "/dev/${POOL_NAME}" --level=1 --raid-devices=2 --metadata=1.2 \
-        --name=root --run /dev/mapper/cryptroot0 /dev/mapper/cryptroot1
+    mdadm --create "$ROOT_MD" --level=1 --raid-devices=2 --metadata=1.2 \
+        --name="$ROOT_MD_NAME" --run /dev/mapper/cryptroot0 /dev/mapper/cryptroot1
+    udevadm settle
+    [ -e "$ROOT_MD" ] || die "${ROOT_MD} did not appear after mdadm --create"
 
     # -m 1: ext4 reserves 5% of the volume for root by default. That default is tuned for
     # a small root partition where a full disk would break the system; on a ~890 GiB data
     # volume it silently withholds ~44 GiB from every non-root user, including postgres.
     # 1% (~9 GiB) keeps the fragmentation headroom the reservation exists for.
-    mkfs.ext4 -q -L root -m 1 "/dev/${POOL_NAME}"
+    mkfs.ext4 -q -L "$ROOT_MD_NAME" -m 1 "$ROOT_MD"
+    udevadm settle
 }
 
 ### Install into the encrypted root #################################################
 
-extract_rootfs() {
-    log "extracting the rootfs into the encrypted root"
+mount_target() {
+    log "mounting the encrypted root at ${MNT}"
     mkdir -p "$MNT"
-    mount "/dev/${POOL_NAME}" "$MNT"
+    mount "$ROOT_MD" "$MNT"
     mkdir -p "$MNT/boot"
-    mount /dev/md2 "$MNT/boot"
-
-    tar --numeric-owner -C "$MNT" -xf "$ROOTFS_TAR"
-    log "rootfs extracted"
-
-    copy_kernel_to_target
+    # /boot (and the ESP under it) are SHARED with the bootstrap, so they are bound in,
+    # not re-created: the kernel, the microcode images and GRUB are already there. The
+    # rslave stops unmounts under $MNT from propagating back to the real /boot.
+    mount --rbind /boot "$MNT/boot"
+    mount --make-rslave "$MNT/boot"
+    [ -f "$MNT/boot/vmlinuz-linux" ] \
+        || die "no kernel at ${MNT}/boot/vmlinuz-linux — /boot is not what this expects"
 }
 
-copy_kernel_to_target() {
-    # The kernel has to be copied explicitly, and getting this wrong is fatal.
+copy_rootfs() {
+    # Copy the running system straight into the target. No staging: the bootstrap root
+    # stays mounted and intact throughout, so there is nothing to protect it from.
     #
-    # The tarball above is taken with --exclude=./boot/* on purpose: /boot is a SEPARATE
-    # filesystem in the target (md2, unencrypted) while the running system's /boot holds
-    # the bootstrap kernel. So `tar` cannot carry it across, and nothing else did either --
-    # meaning the freshly made /boot was empty.
-    #
-    # mkinitcpio -P then fails, because the preset reads /boot/vmlinuz-linux and there is
-    # no such file. That happens later in this script, on a machine whose disks have
-    # already been wiped, which is a bad place to discover it.
-    #
-    # The kernel and both microcode images are the whole boot payload: vmlinuz plus
-    # intel-ucode and amd-ucode, which the preset also names. Copy whatever exists rather
-    # than assuming a particular set, and name what was copied.
-    local f copied=0
-    for f in vmlinuz-linux intel-ucode.img amd-ucode.img; do
-        if [ -f "/boot/$f" ]; then
-            cp -f "/boot/$f" "$MNT/boot/$f"
-            log "  copied $f ($(stat -c %s "$MNT/boot/$f") bytes)"
-            copied=$((copied + 1))
-        fi
-    done
-
-    [ -f "$MNT/boot/vmlinuz-linux" ] \
-        || die "no kernel at $MNT/boot/vmlinuz-linux — mkinitcpio -P would fail and the machine would not boot"
-
-    log "kernel payload copied to the target /boot (${copied} file(s))"
-
-    # /boot's own fstab entry is written by write_system_config from md2's filesystem UUID.
+    # -x keeps rsync on the root filesystem, so /boot, /proc, /sys, /dev, /run, /tmp and
+    # the target itself are skipped by construction; the explicit excludes are for things
+    # that live ON the root filesystem and must not carry across.
+    log "copying the rootfs into the encrypted root"
+    rsync -aAXH --numeric-ids -x \
+        --exclude="${MNT}" \
+        --exclude="${DATA_MOUNT}" \
+        --exclude=/var/lib/cmesh-byol \
+        --exclude="${LOG}" \
+        --exclude=/swap \
+        --exclude=/lost+found \
+        --info=stats1 \
+        / "$MNT/"
+    log "rootfs copied"
 }
 
 create_swap() {
@@ -418,53 +437,50 @@ create_swap() {
     # Hibernation is refused deliberately — see the README. A resume image is a full
     # decrypted copy of RAM, and on a PHI host that is a risk with no operational
     # justification when suspend-to-idle is available.
+    #
+    # Appended, so this MUST run after write_system_config has written the fstab.
     printf '/swap/swapfile  none  swap  defaults,pri=0  0 0\n' >> "$MNT/etc/fstab"
     log "swap: ${swap_mib} MiB at /swap/swapfile (encrypted by the root volume)"
 }
 
 write_system_config() {
-    log "writing fstab, crypttab and mkinitcpio configuration"
+    log "writing fstab, mdadm.conf, crypttab and mkinitcpio configuration"
 
-    # fstab. ZFS-style auto-mounting does not apply; everything is explicit.
+    # Everything is referenced by UUID, never by /dev/mdN. md array NUMBERS are not
+    # stable: an array assembled without a matching /etc/mdadm.conf entry can come up
+    # as md126 or md127. The UUID is a property of the filesystem and does not move.
     #
-    # The swap entry is at the END and is created by create_swap(). It is deliberately
-    # NOT here: swap has to be set up after the rootfs is extracted, and listing it
-    # before the file exists makes every boot log a failure.
-    # Everything is referenced by UUID, never by /dev/mdN.
-    #
-    # md array NUMBERS are not stable: an array assembled without a matching
-    # /etc/mdadm.conf entry can come up as md126 or md127 instead of md2/md3. An fstab
-    # naming /dev/md2 by path then silently fails to mount /boot, and the machine boots
-    # with no kernel available to it. The UUID is a property of the filesystem and does
-    # not move.
-    local root_uuid boot_uuid esp_uuid
-    root_uuid=$(blkid -s UUID -o value "/dev/${POOL_NAME}")
-    boot_uuid=$(blkid -s UUID -o value /dev/md2)
-    esp_uuid=$(blkid -s UUID -o value "${DISKS[0]}p1")
+    # /boot and the ESP are the deployer's: read their UUIDs from what is mounted.
+    local boot_uuid esp_uuid
+    ROOT_UUID=$(blkid -s UUID -o value "$ROOT_MD")
+    boot_uuid=$(findmnt -no UUID /boot)
+    esp_uuid=$(findmnt -no UUID /boot/efi)
 
-    [ -n "$root_uuid" ] || die "could not read the UUID of /dev/${POOL_NAME}"
-    [ -n "$boot_uuid" ] || die "could not read the UUID of /dev/md2"
-    [ -n "$esp_uuid" ]  || die "could not read the UUID of ${DISKS[0]}p1 (was the ESP formatted?)"
+    [ -n "$ROOT_UUID" ] || die "could not read the UUID of ${ROOT_MD}"
+    [ -n "$boot_uuid" ] || die "could not read the UUID of the /boot filesystem"
+    [ -n "$esp_uuid" ]  || die "could not read the UUID of the ESP at /boot/efi"
 
     cat > "$MNT/etc/fstab" <<EOF
 # Generated by cmesh-byol-install. LUKS under RAID1. UUIDs only: md numbers are not stable.
-UUID=${root_uuid}  /          ext4  defaults                      0 1
+UUID=${ROOT_UUID}  /          ext4  defaults                      0 1
 UUID=${boot_uuid}  /boot      ext4  defaults,nofail              0 2
 UUID=${esp_uuid}   /boot/efi  vfat  defaults,nofail,umask=0077  0 2
 EOF
 
-    # /etc/mdadm.conf on the TARGET, so md2 and md3 assemble under the names the
-    # initramfs and any operator expect instead of drifting to md126/md127.
+    # /etc/mdadm.conf on the TARGET. `--scan` lists the arrays that are RUNNING now: the
+    # deployer's /boot and bootstrap-root arrays, and the new encrypted root. The payload
+    # array was stopped before this point, so it is correctly absent — every line here
+    # describes an array that will exist on the installed system.
     log "writing the target /etc/mdadm.conf"
     if mdadm --detail --scan > "$MNT/etc/mdadm.conf" 2>/dev/null && [ -s "$MNT/etc/mdadm.conf" ]; then
         printf 'HOMEHOST <system>\n' >> "$MNT/etc/mdadm.conf"
+        grep -q "$ROOT_MD_NAME" "$MNT/etc/mdadm.conf" \
+            || die "the new root array is missing from mdadm --detail --scan"
         log "  $(grep -c '^ARRAY' "$MNT/etc/mdadm.conf") array(s) recorded for the installed system"
+        sed 's/^/    /' "$MNT/etc/mdadm.conf"
     else
-        warn "could not generate the target mdadm.conf; array numbers may not be stable"
+        die "could not generate the target mdadm.conf"
     fi
-
-    # Swap lives in a FILE on the encrypted root, not its own partition. See
-    # create_swap() for why that is the compliance-safe choice here.
 
     # crypttab for the INITRAMFS: the root array cannot assemble until both mappings
     # exist, so these must be unlocked before mdadm runs. Keyed by UUID (device names
@@ -472,19 +488,18 @@ EOF
     # cmesh-byol-finalize deletes once the TPM is enrolled.
     cat > "$MNT/etc/crypttab.initramfs" <<EOF
 # Generated by cmesh-byol-install.
-cryptroot0  UUID=$(cryptsetup luksUUID "${DISKS[0]}p3")  ${LUKS_KEY}  luks,discard,tpm2-device=auto
-cryptroot1  UUID=$(cryptsetup luksUUID "${DISKS[1]}p3")  ${LUKS_KEY}  luks,discard,tpm2-device=auto
+cryptroot0  UUID=$(cryptsetup luksUUID "${MEMBERS[0]}")  ${LUKS_KEY}  luks,discard,tpm2-device=auto
+cryptroot1  UUID=$(cryptsetup luksUUID "${MEMBERS[1]}")  ${LUKS_KEY}  luks,discard,tpm2-device=auto
 EOF
 
     # The installed system's initramfs is NOT the bootstrap's. systemd + sd-encrypt is
     # correct here (it understands the crypttab above and a TPM2 keyslot without
-    # prompting); mdadm_udev assembles md2/md3 after the mappings appear.
-    #
-    # It could not be done on the running bootstrap because the mappings did not exist
-    # yet — hence this second, deliberate generation inside the target.
+    # prompting); mdadm_udev assembles the arrays after the mappings appear. nvme and
+    # raid1 are named explicitly rather than left to autodetect: one missed module is an
+    # unbootable machine with no output.
     cat > "$MNT/etc/mkinitcpio.conf" <<'EOF'
 # Generated by cmesh-byol-install.
-MODULES=()
+MODULES=(nvme raid1)
 BINARIES=()
 FILES=(/boot/cmesh-luks.key)
 HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block mdadm_udev sd-encrypt filesystems fsck)
@@ -495,117 +510,84 @@ EOF
     rm -f "$MNT/etc/machine-id"
 }
 
-generate_initramfs() {
-    log "generating the initramfs inside the target"
-    # mkinitcpio needs /proc, /sys and /dev, and it reads the keyfile path listed in
-    # FILES=, so the target's /boot must be mounted.
+with_chroot_mounts() {
+    # Run a command with /dev, /proc and /sys bound into the target, then unbind them.
+    local fs
     for fs in dev proc sys; do
         mount --rbind "/$fs" "$MNT/$fs"
         mount --make-rslave "$MNT/$fs"
     done
-
-    chroot "$MNT" mkinitcpio -P
-
+    local rc=0
+    "$@" || rc=$?
     for fs in dev proc sys; do
         umount -R "$MNT/$fs" 2>/dev/null || true
     done
-    ls -1 "$MNT/boot"/initramfs-*.img >/dev/null 2>&1 \
-        || die "no initramfs was produced in the target"
+    return "$rc"
 }
 
-install_grub() {
-    log "installing GRUB to both ESPs"
+generate_initramfs() {
+    # POINT OF NO RETURN FOR THE BOOTSTRAP. /boot is shared, so this overwrites the
+    # bootstrap's initramfs with the target's. From here the machine boots the encrypted
+    # system or nothing; everything that can be verified beforehand has been.
+    log "generating the initramfs inside the target (overwrites the shared /boot image)"
+    with_chroot_mounts chroot "$MNT" mkinitcpio -P
 
-    mkdir -p "$MNT/boot/efi"
-    mount "${DISKS[0]}p1" "$MNT/boot/efi"
+    local img="$MNT/boot/initramfs-linux.img"
+    [ -f "$img" ] || die "no initramfs was produced at ${img}"
+    # The image must carry the crypttab and the keyfile, or the first boot stops at a
+    # passphrase prompt that nobody is there to answer.
+    lsinitcpio "$img" | grep -q 'etc/crypttab' \
+        || die "the initramfs does not contain etc/crypttab; sd-encrypt would have nothing to unlock"
+    lsinitcpio "$img" | grep -q 'cmesh-luks.key' \
+        || die "the initramfs does not contain the temporary keyfile; the first boot would prompt"
+    log "initramfs verified: crypttab and keyfile present"
+}
 
-    for fs in dev proc sys; do
-        mount --rbind "/$fs" "$MNT/$fs"
-        mount --make-rslave "$MNT/$fs"
-    done
+update_bootloader() {
+    # GRUB itself is NOT reinstalled. The deploy hook put it on the ESP(s) and it already
+    # boots this /boot; only grub.cfg has to change, to point root= at the new filesystem.
+    log "regenerating grub.cfg for the encrypted root"
+    with_chroot_mounts chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
 
-    # --removable writes the loader to the UEFI REMOVABLE MEDIA PATH,
-    # \EFI\BOOT\BOOTX64.EFI, which is the location firmware falls back to when no
-    # NVRAM boot entry points anywhere. That fallback is not optional here:
-    # --no-nvram means we deliberately create no NVRAM entry (OVHcloud servers
-    # network-boot and we must not touch the firmware boot order), so without the
-    # removable path there is nothing for the firmware to find.
-    #
-    # This is exactly how the first deployment failed: the ESP held \EFI\cmesh\
-    # grubx64.efi, no \EFI\BOOT\ at all, and no NVRAM entry. OVH's rEFInd reported
-    # "Chain on hard drive failed", fell through to iPXE, and the machine never
-    # booted -- so cmesh-byol-install never ran and the disks were left as a plain
-    # ext4 RAID1 with no LUKS.
-    #
-    # --removable implies --no-nvram, which is kept explicitly for the reader.
-    chroot "$MNT" grub-install --target=x86_64-efi \
-        --efi-directory=/boot/efi --bootloader-id=cmesh \
-        --removable --no-nvram --recheck
+    local cfg="$MNT/boot/grub/grub.cfg"
+    [ -f "$cfg" ] || die "grub-mkconfig produced no ${cfg}"
 
-    chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
-
-    for fs in dev proc sys; do
-        umount -R "$MNT/$fs" 2>/dev/null || true
-    done
-
-    umount "$MNT/boot/efi"
-
-    # Second ESP: the machine must still boot if the first disk fails. Distinct
-    # bootloader-id so the firmware sees two entries rather than one being overwritten.
-    #
-    # DELIBERATELY NOT re-mkfs'd here. It was formatted in create_boot_array along with the
-    # first disk's, and formatting it again at this point would be pointless at best -- the
-    # two ESPs must BOTH carry the loader, and this mount is only to write the second copy.
-    mount "${DISKS[1]}p1" "$MNT/boot/efi"
-    for fs in dev proc sys; do
-        mount --rbind "/$fs" "$MNT/$fs"
-        mount --make-rslave "$MNT/$fs"
-    done
-    # Same --removable treatment, so the second disk is ALSO bootable without an NVRAM
-    # entry. A fallback loader on only one ESP would make the mirror pointless for boot.
-    chroot "$MNT" grub-install --target=x86_64-efi \
-        --efi-directory=/boot/efi --bootloader-id=cmesh2 \
-        --removable --no-nvram --recheck
-    for fs in dev proc sys; do
-        umount -R "$MNT/$fs" 2>/dev/null || true
-    done
-    umount "$MNT/boot/efi"
-
-    # Assert the two things the firmware needs, on BOTH ESPs, before declaring success.
-    #
-    # The first deployment failed precisely here and said nothing: grub-install exited 0,
-    # the installer reported "GRUB installed on both ESPs", the machine then could not
-    # boot at all, and the cause was only findable by mounting the ESP from rescue mode
-    # and noticing a missing directory. A failed boot is the most expensive possible way
-    # to discover a missing file, and both of these are one ls away.
-    local d esp verr=0
-    local -a esps=("${DISKS[0]}p1" "${DISKS[1]}p1")
-    for d in "${esps[@]}"; do
-        esp="$(mktemp -d)"
-        if ! mount -o ro "$d" "$esp" 2>/dev/null; then
-            warn "could not mount ${d} to verify its ESP contents"
-            verr=1
-            continue
-        fi
-        # \EFI\BOOT\BOOTX64.EFI is what firmware boots when no NVRAM entry exists, which
-        # is our situation by design (--no-nvram).
-        [ -f "$esp/EFI/BOOT/BOOTX64.EFI" ] \
-            || { warn "${d}: /EFI/BOOT/BOOTX64.EFI is MISSING — this disk will not boot without an NVRAM entry"; verr=1; }
-        ls "$esp"/EFI/cmesh*/grubx64.efi >/dev/null 2>&1 \
-            || { warn "${d}: no /EFI/cmesh*/grubx64.efi found"; verr=1; }
-        umount "$esp"
-        rmdir "$esp"
-    done
-
-    # grub.cfg lives on /boot, not the ESP, and GRUB cannot start without it.
-    [ -f "$MNT/boot/grub/grub.cfg" ] \
-        || { warn "/boot/grub/grub.cfg is MISSING — GRUB would drop to a rescue prompt"; verr=1; }
-
-    if [ "$verr" -ne 0 ]; then
-        die "GRUB verification failed; refusing to report a bootable system. Fix before rebooting."
+    if ! grep -q "root=UUID=${ROOT_UUID}" "$cfg"; then
+        # grub-probe could not resolve the root filesystem's UUID through dm-crypt, so
+        # 10_linux fell back to a device path, which is not stable. Pin it ourselves.
+        warn "grub.cfg does not carry root=UUID=${ROOT_UUID}; pinning it via GRUB_CMDLINE_LINUX"
+        sed -i -E "s|^GRUB_CMDLINE_LINUX=\"([^\"]*)\"|GRUB_CMDLINE_LINUX=\"\1 root=UUID=${ROOT_UUID}\"|" \
+            "$MNT/etc/default/grub"
+        grep -q "root=UUID=${ROOT_UUID}" "$MNT/etc/default/grub" \
+            || die "could not add root=UUID to ${MNT}/etc/default/grub"
+        with_chroot_mounts chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
+        grep -q "root=UUID=${ROOT_UUID}" "$cfg" \
+            || die "grub.cfg still does not reference the encrypted root"
     fi
 
-    log "GRUB installed and verified on both ESPs (removable path + grub.cfg present)"
+    # The loader the firmware falls back to, on the ESP the deployer mounted. Without an
+    # NVRAM entry (OVHcloud servers network-boot; the hook uses --no-nvram) this file is
+    # the only boot path.
+    [ -f /boot/efi/EFI/BOOT/BOOTX64.EFI ] \
+        || die "/boot/efi/EFI/BOOT/BOOTX64.EFI is missing; the deploy hook did not install a loader"
+
+    # The other disk's ESP should carry a mirror of it (the hook copies it). A missing
+    # mirror costs redundancy, not the boot, so it is a warning.
+    local esp tmp
+    for esp in $(blkid -o device -t PARTTYPE=c12a7328-f81f-11d2-ba4b-00a0c93ec93b 2>/dev/null); do
+        findmnt -rn -S "$esp" >/dev/null 2>&1 && continue
+        tmp=$(mktemp -d)
+        if mount -o ro "$esp" "$tmp" 2>/dev/null; then
+            [ -f "$tmp/EFI/BOOT/BOOTX64.EFI" ] \
+                || warn "${esp}: no /EFI/BOOT/BOOTX64.EFI; this disk cannot boot on its own"
+            umount "$tmp"
+        else
+            warn "could not mount ${esp} to check for a mirrored loader"
+        fi
+        rmdir "$tmp"
+    done
+
+    log "grub.cfg points at UUID=${ROOT_UUID}; loader present on the ESP"
 }
 
 scrub_config_drive() {
@@ -614,11 +596,12 @@ scrub_config_drive() {
     log "scrubbing the config drive"
     local dev
     for dev in $(blkid -o device -t LABEL=cidata 2>/dev/null; blkid -o device -t LABEL=config-2 2>/dev/null); do
-        if ! dd if=/dev/urandom of="$dev" bs=1M count=8 status=none 2>/dev/null; then
-            warn "could not scrub ${dev} — it may be removed with the old partition table"
+        if dd if=/dev/urandom of="$dev" bs=1M count=8 status=none 2>/dev/null; then
+            log "scrubbed ${dev}"
+        else
+            warn "could not scrub ${dev} — the passphrase may remain on it"
         fi
     done
-    warn "if any config-drive device survived, the passphrase may remain on it"
 }
 
 install_ssh_keys() {
@@ -633,7 +616,7 @@ install_ssh_keys() {
     # The keys come from the config drive rather than from whatever cloud-init left in
     # the rootfs, because this is deterministic: it does not depend on whether cloud-init
     # ran before the config drive was scrubbed, or on which of its stages delivered the
-    # keys. The rootfs is staged from the running bootstrap system, so anything
+    # keys. The rootfs is copied from the running bootstrap system, so anything
     # cloud-init did write does carry over — but "carries over" is not something to bet
     # remote access on.
     if [ -n "$CMESH_SSH_KEYS" ]; then
@@ -668,46 +651,8 @@ install_ssh_keys() {
     warn "  reach it over the OVHcloud KVM console, then: pacman -S openssh && systemctl enable --now sshd"
 }
 
-### Main ############################################################################
-
-main() {
-    log "cmesh-byol-install starting"
-
-    check_already_done
-    check_arch
-    check_memory
-    check_disks
-    check_tools
-    read_passphrase
-
-    stage_rootfs
-
-    # Everything above is non-destructive and re-runnable. From here the disks go.
-    partition_disks
-
-    mkdir -p "$WORKDIR"
-    local keyfile="$WORKDIR/luks.key"
-    # 64 random bytes, and it goes into a SECOND keyslot so the operator passphrase
-    # remains valid after this file is deleted.
-    dd if=/dev/urandom of="$keyfile" bs=64 count=1 status=none
-    chmod 0400 "$keyfile"
-
-    create_boot_array
-    create_encrypted_root "$keyfile"
-
-    extract_rootfs
-    # Before write_system_config: the swap entry is appended to the fstab it writes.
-    create_swap
-    write_system_config
-
-    # The temporary unlock key lives on the (unencrypted) /boot so the machine can
-    # reboot unattended. cmesh-byol-finalize removes it once the TPM is enrolled.
-    cp "$keyfile" "$MNT${LUKS_KEY}"
-    chmod 0400 "$MNT${LUKS_KEY}"
-    rm -f "$keyfile"
-
-    generate_initramfs
-    install_grub
+configure_target_system() {
+    log "configuring the installed system"
 
     # Networking. cloud-init configures the BOOTSTRAP image, not the installed system,
     # so without this the machine comes up encrypted and unreachable.
@@ -719,12 +664,19 @@ Name=en* eth*
 [Network]
 DHCP=yes
 EOF
-
     ln -sf /run/systemd/resolve/stub-resolv.conf "$MNT/etc/resolv.conf"
 
     # Enable the finalize unit; it is what removes the temporary key.
     ln -sf /etc/systemd/system/cmesh-byol-finalize.service \
         "$MNT/etc/systemd/system/multi-user.target.wants/cmesh-byol-finalize.service"
+
+    # This installer must NOT run again on the installed system: disable its unit there
+    # and write the marker the finalize unit's ConditionPathExists looks for. Without
+    # both, the installed system would try to install itself a second time and finalize
+    # would never run.
+    rm -f "$MNT/etc/systemd/system/multi-user.target.wants/cmesh-byol-install.service"
+    install -d -m 0755 "$MNT$(dirname "$MARKER")"
+    date -Is > "$MNT$MARKER"
 
     chroot "$MNT" systemd-machine-id-setup
     chroot "$MNT" systemctl enable systemd-networkd systemd-resolved 2>/dev/null || true
@@ -732,22 +684,66 @@ EOF
     install_ssh_keys
 
     # cloud-init served the BOOTSTRAP boot only: it is what made the config drive
-    # readable, and that drive has just been scrubbed. Leaving it enabled on the
+    # readable, and that drive is about to be scrubbed. Leaving it enabled on the
     # installed system means a service that waits for a datasource that is never coming
     # — and cloud-init has network-configuration modules of its own, which would race
     # systemd-networkd for the interface. Networking above is ours; cloud-init is done.
+    local unit
     for unit in cloud-init.service cloud-init-local.service cloud-config.service \
                 cloud-final.service cloud-init.target; do
         chroot "$MNT" systemctl disable "$unit" 2>/dev/null || true
     done
     log "disabled cloud-init on the installed system (networking is systemd-networkd)"
+}
+
+### Main ############################################################################
+
+main() {
+    log "cmesh-byol-install starting"
+
+    check_already_done
+    check_arch
+    check_tools
+    check_layout
+    read_passphrase
+
+    # Everything above is non-destructive and re-runnable. From here the payload goes.
+    release_payload
+
+    mkdir -p "$WORKDIR"
+    local keyfile="$WORKDIR/luks.key"
+    # 64 random bytes, and it goes into a SECOND keyslot so the operator passphrase
+    # remains valid after this file is deleted.
+    dd if=/dev/urandom of="$keyfile" bs=64 count=1 status=none
+    chmod 0400 "$keyfile"
+
+    create_encrypted_root "$keyfile"
+
+    mount_target
+    copy_rootfs
+    write_system_config
+    # After write_system_config: the swap entry is appended to the fstab it writes.
+    create_swap
+    configure_target_system
+
+    # The temporary unlock key lives on the (unencrypted, shared) /boot so the machine
+    # can reboot unattended. cmesh-byol-finalize removes it once the TPM is enrolled.
+    cp "$keyfile" "$MNT${LUKS_KEY}"
+    chmod 0400 "$MNT${LUKS_KEY}"
+    rm -f "$keyfile"
+
+    # Last, because these two rewrite the shared /boot: once they run, the next boot is
+    # the encrypted system.
+    generate_initramfs
+    update_bootloader
 
     sync
     umount -R "$MNT" 2>/dev/null || true
 
     scrub_config_drive
 
-    # Marker last: until this exists, a failure leaves the system re-runnable.
+    # Marker on the bootstrap root last: until this exists, a failure leaves the system
+    # re-runnable (the target marker was written inside configure_target_system).
     mkdir -p "$(dirname "$MARKER")"
     date -Is > "$MARKER"
     systemctl disable cmesh-byol-install.service || true
@@ -755,10 +751,9 @@ EOF
     echo
     log "INSTALL COMPLETE — rebooting into the encrypted system"
     echo "    After it comes back, verify with the README's 'Verifying an installation'."
-    echo "    The temporary unlock key at /boot/cmesh-luks.key is removed by"
+    echo "    The temporary unlock key at ${LUKS_KEY} is removed by"
     echo "    cmesh-byol-finalize once the TPM is enrolled."
     echo
-    rm -f "$ROOTFS_TAR"
     sync
     sleep 2
     systemctl reboot
