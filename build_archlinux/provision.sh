@@ -89,8 +89,19 @@ sed -i 's/GRUB_GFXPAYLOAD_LINUX=.*/GRUB_GFXPAYLOAD_LINUX="text"/' /etc/default/g
 # install, so it only needs to reach its own root partition — the encrypted system's
 # initramfs is generated later, inside the chroot, by files/cmesh-byol-install.
 #
+# mdadm_udev IS REQUIRED, and omitting it cost a deployment. The bootstrap root is
+# /dev/md3 — an md array over NVMe. `block` ships the block-layer modules and `filesystems`
+# knows how to mount ext4, but NEITHER of them ASSEMBLES an md array. Without mdadm_udev
+# the kernel reaches userspace, finds no /dev/md3, and waits for a root device that will
+# never appear. The symptom is GRUB loading the kernel, "loading initial ramdisk ...", and
+# then silence forever — no panic, no error, nothing.
+#
+# The deploy hook's MODULES=(nvme raid1) ships the raid1 DRIVER, which is necessary and not
+# sufficient: a driver is not an assembly step. Both are needed, and they are different
+# things, which is exactly the confusion that produced this bug.
+#
 # No "net" hook: it targets the busybox init and conflicts with the systemd hook.
-sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect microcode modconf kms keyboard keymap sd-vconsole block filesystems fsck)/' /etc/mkinitcpio.conf
+sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect microcode modconf kms keyboard keymap sd-vconsole block mdadm_udev filesystems fsck)/' /etc/mkinitcpio.conf
 
 ### Phase 3: Collapse to a single partition (BYOL contract) ###
 
@@ -504,6 +515,35 @@ if [ -f /etc/mkinitcpio.conf ]; then
         grep -q 'nvme' /etc/mkinitcpio.conf || sed -i 's/^MODULES=(/MODULES=(nvme raid1 /' /etc/mkinitcpio.conf
     fi
     grep '^MODULES=' /etc/mkinitcpio.conf 2>/dev/null | sed 's/^/  /' || warn "could not read MODULES= from /etc/mkinitcpio.conf"
+
+    # Write /etc/mdadm.conf from the arrays that actually exist on this machine.
+    #
+    # The hook list above carries mdadm_udev, which is what assembles the array -- but
+    # WHICH NAME it assembles as is not guaranteed. This machine's /etc/fstab refers to
+    # /dev/md2 and /dev/md3, and an array that comes up as md126 or md127 instead makes
+    # /boot silently fail to mount and the root device unfindable. mdadm.conf is what pins
+    # the names, and it must be written HERE, on the target, because the array names and
+    # UUIDs are properties of this machine's disks rather than of the image.
+    #
+    # OVHcloud's own reference hook does exactly this, for exactly this reason.
+    #
+    # Best-effort: `mdadm --detail --scan` needs the arrays to be visible from inside the
+    # chroot, and if they are not, the hook list alone still assembles them -- it may just
+    # pick different names. Log it rather than fail the deployment.
+    log "writing /etc/mdadm.conf"
+    if [ -e /etc/mdadm.conf ]; then
+        cp -f /etc/mdadm.conf /etc/mdadm.conf.cmesh-bak 2>/dev/null || true
+    fi
+    if mdadm --detail --scan > /etc/mdadm.conf 2>/dev/null && [ -s /etc/mdadm.conf ]; then
+        # HOMEURL silences an irrelevant warning on every mdadm invocation without it.
+        printf 'HOMEURL hostname=%s\n' "$(uname -n 2>/dev/null || echo localhost)" >> /etc/mdadm.conf
+        log "  $(grep -c '^ARRAY' /etc/mdadm.conf) array(s) recorded"
+        sed 's/^/  /' /etc/mdadm.conf
+    else
+        warn "mdadm --detail --scan produced nothing; the arrays are not visible from here"
+        warn "  mdadm_udev will still assemble them, but the names may not match /etc/fstab"
+    fi
+    step "write /etc/mdadm.conf" $?
 
     log "rebuilding the initramfs for this machine"
     mkinitcpio -P
