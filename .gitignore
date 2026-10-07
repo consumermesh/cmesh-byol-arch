@@ -35,5 +35,5 @@ erl_crash.dump
 deploy.env~
 
 # Emacs autosave and lock files; #deploy.json# would carry the passphrase and SSH key
-#*#
+\#*\#
 .#*
