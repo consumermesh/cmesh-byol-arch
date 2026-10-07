@@ -535,8 +535,12 @@ if [ -f /etc/mkinitcpio.conf ]; then
         cp -f /etc/mdadm.conf /etc/mdadm.conf.cmesh-bak 2>/dev/null || true
     fi
     if mdadm --detail --scan > /etc/mdadm.conf 2>/dev/null && [ -s /etc/mdadm.conf ]; then
-        # HOMEURL silences an irrelevant warning on every mdadm invocation without it.
-        printf 'HOMEURL hostname=%s\n' "$(uname -n 2>/dev/null || echo localhost)" >> /etc/mdadm.conf
+        # HOMEHOST (not HOMEURL -- the man page lists HOMEHOST, and its example is
+        # exactly "HOMEHOST <system>"). This is not decoration: when an array is assembled
+        # by auto-assembly, one whose metadata does not record this host is given a
+        # "foreign" name like /dev/md/1_1 instead of /dev/md1. <system> takes the hostname
+        # from gethostname(2) rather than hardcoding it.
+        printf 'HOMEHOST <system>\n' >> /etc/mdadm.conf
         log "  $(grep -c '^ARRAY' /etc/mdadm.conf) array(s) recorded"
         sed 's/^/  /' /etc/mdadm.conf
     else
