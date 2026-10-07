@@ -1,0 +1,21 @@
+
+                   -`
+                  .o+`                   Arch Linux  ·  cmesh BYOL
+                 `ooo/
+                `+oooo:                  root     LUKS2 aes-xts-plain64 · RAID1 · md/cmeshroot
+               `+oooooo:                 unlock   TPM2 (PCR 7), passphrase as rescue
+               -+oooooo+:                /boot    unencrypted, shared with the bootstrap
+             `/:-:++oooo+:               rescue   bootstrap root stays on p3 (ext4, dormant)
+            `/++++/+++++++:
+           `/++++++++++++++:             logs     /var/log/cmesh-byol-install.log
+          `/+++ooooooooooooo/`                    /var/log/cmesh-byol-finalize.log
+         ./ooosssso++osssssso+`                   /var/log/ovh-make-bootable.log  (bootstrap root)
+        .oossssso-````/ossssss+`
+       -osssssso.      :ssssssso.        check    cryptsetup status cryptroot0
+      :osssssss/        osssso+++.                systemd-cryptenroll /dev/nvme0n1p4
+     /ossssssss/        +ssssooo/-                cat /proc/mdstat
+   `/ossssso+/:-        -:/+osssso+-
+  `+sso+:-`                 `.-/+oso:    docs     https://github.com/consumermesh/cmesh-byol-arch
+ `++:.                           `-/+/
+ .`                                 `/
+

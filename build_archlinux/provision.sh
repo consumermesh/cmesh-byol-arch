@@ -175,6 +175,17 @@ install -Dm644 "$FILES_SRC/cmesh-byol-install.service" \
 install -Dm644 "$FILES_SRC/cmesh-byol-finalize.service" \
     /etc/systemd/system/cmesh-byol-finalize.service
 
+# Login banner: the Arch logo plus what this machine is and where its logs are. Shown
+# by pam_motd on SSH and console logins (Arch's sshd_config has PrintMotd no and leaves
+# it to PAM). Optional: a missing file costs a banner, not a build. The installer rsyncs
+# /etc into the encrypted system, so it carries over.
+if [ -f "$FILES_SRC/motd" ]; then
+    install -Dm644 "$FILES_SRC/motd" /etc/motd
+    echo ">>> /etc/motd installed"
+else
+    echo ">>> WARNING: no motd delivered; skipping the login banner" >&2
+fi
+
 # The installer runs on the first boot of the deployed system. It is NOT enabled here:
 # enabling it would make the build VM try to install over its own disks.
 ln -sf /etc/systemd/system/cmesh-byol-install.service \
