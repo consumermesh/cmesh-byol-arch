@@ -23,8 +23,9 @@ There is no `luks`/`dm-crypt` filesystem type, and no encryption parameter anywh
 the partitioning schema. So **an encrypted disk cannot be produced by the deployer.**
 It has to be produced by the image itself.
 
-That is what this repo does: the BYOL image is a **bootstrap**. Its first boot
-re-partitions both disks, builds the encrypted stack, installs the system into it, and
+That is what this repo does: the BYOL image is a **bootstrap**. OVH's deployer is asked
+for one extra RAID1 partition that nothing runs from. On first boot the bootstrap takes
+that partition, builds the encrypted stack in it, installs the system into it, and
 reboots into the encrypted installation.
 
 ZFS is the other candidate, because it is the one encryption primitive OVH's API does
@@ -33,14 +34,29 @@ expose. It is rejected here deliberately — see [Why not ZFS](#why-not-zfs).
 ## The layout it produces
 
 ```
-nvme0n1                              nvme1n1
-├─p1  512M  vfat  (ESP)              ├─p1  512M  vfat  (ESP)
-├─p2    1G  linux-raid ─┐            ├─p2    1G  linux-raid ─┐
-│                      ├─ md2 (raid1, ext4) → /boot         │
-└─p3  ~893G LUKS2 ─┐   │            └─p3  ~893G LUKS2 ─┐    │
-   └─ cryptroot0 ──┴───┴──── md3 (raid1, ext4) ────────┴────┘
+nvme0n1                                nvme1n1
+├─p1  511M  vfat  (ESP) /boot/efi      ├─p1  511M  vfat  (ESP, loader mirrored)
+├─p2    1G  linux-raid ─┐              ├─p2    1G  linux-raid ─┐
+│                       ├─ md (raid1, ext4) → /boot            │   [unencrypted]
+├─p3    8G  linux-raid ─┐              ├─p3    8G  linux-raid ─┐
+│                       ├─ md (raid1, ext4) → bootstrap /      │   [dormant after install]
+└─p4  ~880G LUKS2 ─┐    │              └─p4  ~880G LUKS2 ─┐    │
+   └─ cryptroot0 ──┴────┴── md/cmeshroot (raid1, ext4) ───┴────┘
                                   → /  (and /swap/swapfile inside it)
 ```
+
+**Every partition above is created by OVH's partitioner**, from the `storage` block in
+the reinstall payload (see [Deploy it](#5-deploy-it)). The installer never rewrites a
+partition table. It cannot: it runs from a root filesystem on these same disks, and the
+kernel will not reload a partition table while any partition on the disk is held open.
+An earlier design that wiped the disks from the running system failed exactly there.
+
+So the deployer is asked for `/boot`, a small `/` for the bootstrap, and a third RAID1
+partition mounted at `/data` with `size: 0` (the rest of the disk). `/data` is the
+**payload**: nothing runs from it, so the installer can stop its array, LUKS-format the
+two members, and build the encrypted root on top. `/boot` and the ESPs are shared with
+the bootstrap and keep the GRUB the deploy hook installed. The bootstrap root stays on
+disk, unused, as a known-good rescue environment; reclaim it later if you want the 8 GiB.
 
 **LUKS sits *under* RAID, not over it.** This is the single most important decision in
 the design:
@@ -137,16 +153,14 @@ out-of-tree module, kernel updates unconstrained.
 
 ## Requirements for the target server
 
-- **Exactly two NVMe disks** of equal size. The installer validates this and refuses to
-  run otherwise.
-- **KVM/IPMI access.** You will need it. This image repartitions live disks; do not run
-  it blind.
-- **≥ 8 GiB RAM.** The self-install holds a compressed copy of the root filesystem in
-  `/run` (tmpfs) while it destroys the disks. It refuses to start below the threshold.
-- UEFI boot. The installer writes GRUB to both ESPs.
+- **Two NVMe disks** of equal size, deployed with the three-partition `storage` layout
+  below. The installer checks that `/data` is a RAID1 array with one member per disk and
+  refuses to run otherwise.
+- **KVM/IPMI access.** You will need it. Do not run this blind.
+- UEFI boot. The deploy hook writes GRUB to the ESP and mirrors the loader to the other.
 
-> **This image destroys both disks, unconditionally.** That is its purpose. It is not
-> safe to attach to a server holding data you want to keep.
+> **This image destroys the `/data` partition, unconditionally.** That is its purpose.
+> It is not safe to attach to a server holding data you want to keep.
 
 ## How to use it
 
@@ -220,21 +234,41 @@ Via the OVHcloud Control Panel: **Bare Metal Cloud → Dedicated servers → you
 General information → `...` → Install → Custom → Bring Your Own Linux**, then supply the
 image URL and checksum.
 
-Via the API, the important part is the **passphrase** — it is supplied through
-cloud-init, not through a custom field:
+Via the API (`scripts/ovh-reinstall.exs` sends `deploy.json`; start from
+`deploy.json.example`), two parts matter. The **`storage` layout** is what the installer
+expects to find, and the **passphrase** is supplied through cloud-init, not through a
+custom field:
 
 ```json
 {
   "operatingSystem": "byolinux_64",
+  "storage": [{
+    "diskGroupId": 1,
+    "hardwareRaid": [],
+    "partitioning": {
+      "disks": 2,
+      "layout": [
+        { "fileSystem": "ext4", "mountPoint": "/boot", "size": 1024, "raidLevel": 1, "extras": {} },
+        { "fileSystem": "ext4", "mountPoint": "/",     "size": 8192, "raidLevel": 1, "extras": {} },
+        { "fileSystem": "ext4", "mountPoint": "/data", "size": 0,    "raidLevel": 1, "extras": {} }
+      ]
+    }
+  }],
   "customizations": {
     "hostname": "cmesh-hipaa",
     "imageURL": "https://github.com/consumermesh/cmesh-byol-arch/releases/download/v1/archlinux.qcow2",
     "imageCheckSum": "<sha512 from the release>",
     "imageCheckSumType": "sha512",
-    "configDriveUserData": "<base64 of the cloud-config below>"
+    "configDriveUserData": "<base64 of the cloud-config below>",
+    "efiBootloaderPath": "\\EFI\\BOOT\\BOOTX64.EFI"
   }
 }
 ```
+
+The ESP is not listed: OVH adds one per disk on UEFI servers. `/data` must be RAID1,
+must have one member on each disk, and is the only thing the installer destroys. The
+Control Panel's Custom partitioning can produce the same layout, but it has been observed
+to drop `configDriveUserData`, so prefer the API.
 
 `configDriveUserData` is **base64-encoded**. The cleartext it encodes:
 
@@ -283,14 +317,13 @@ servers network-boot and the firmware boot order must not be touched, and with n
 entry the firmware only ever finds the removable path. It also regenerates `grub.cfg`,
 and fails loudly if either file is missing.
 
-The hook deliberately does **not** touch the partition layout. It runs before the first
-reboot, while the layout OVH just created is still the one the installer is about to
-replace.
+The hook does **not** touch the partition layout, and neither does anything else: the
+layout OVH created is the final one.
 
 **Phase 2 — `cmesh-byol-install`, on the first boot of the deployed system.**
-Only reachable once Phase 1 has produced a loader. It reads the LUKS passphrase, stages
-the rootfs in tmpfs, destroys both partition tables, builds LUKS2-under-RAID1, installs
-into it, and reboots.
+Only reachable once Phase 1 has produced a loader. It reads the LUKS passphrase, stops
+the `/data` array, builds LUKS2-under-RAID1 on its members, copies the running system
+into it, points the shared `/boot` at it, and reboots.
 
 > The ordering is the subtle part. Phase 2 cannot install the bootloader that Phase 2
 > needs in order to run. A no-op Phase 1 therefore does not produce a degraded system —
@@ -300,14 +333,22 @@ into it, and reboots.
 
 Roughly two minutes after the deployer finishes:
 
-1. `cmesh-byol-install.service` starts and refuses to continue unless the disk count,
-   memory, KVM/block-device access and TPM presence are all as expected.
-2. It reads `cmesh_luks_passphrase` from the config drive into memory.
-3. It copies the running root filesystem into a compressed tarball **in `/run` (tmpfs)**.
-4. It destroys both partition tables and rebuilds the layout above.
-5. It extracts the tarball into the encrypted root, writes `fstab` / `crypttab` /
-   `mkinitcpio.conf`, and generates the initramfs.
-6. It installs GRUB to **both** ESPs.
+1. `cmesh-byol-install.service` starts and refuses to continue unless `/boot` and
+   `/boot/efi` are mounted, `/data` is a RAID1 array with one member on each of two
+   disks, and nothing else holds those members.
+2. It reads `cmesh_luks_passphrase` (and the SSH keys) from the config drive into memory.
+3. It unmounts `/data`, stops its array, and wipes the md superblocks from both members.
+   Nothing else on the disks is touched.
+4. It LUKS-formats both members, opens them as `cryptroot0`/`cryptroot1`, and creates
+   `md/cmeshroot` over the two mappings. ext4, 1% reserved.
+5. It mounts the new root, binds the shared `/boot` into it, and `rsync`s the running
+   system across. Then it writes `fstab` (UUIDs only), `mdadm.conf`,
+   `crypttab.initramfs` and `mkinitcpio.conf`, enables sshd and networking, and disables
+   itself and cloud-init on the installed system.
+6. Last, because it rewrites the shared `/boot`: it generates the initramfs (verified to
+   contain the crypttab and keyfile) and regenerates `grub.cfg` (verified to carry
+   `root=UUID=` of the new filesystem). GRUB itself is not reinstalled; the hook's loader
+   is reused.
 7. It **scrubs the config drive**, then reboots.
 8. On the way back up, the initramfs unlocks LUKS from a temporary keyfile on `/boot`,
    and a one-shot `cmesh-byol-finalize.service`:
@@ -342,14 +383,14 @@ turns silent unlock into a passphrase prompt.
 cryptsetup status cryptroot0          # open
 cryptsetup status cryptroot1
 lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
-#   md3's two children must be cryptroot0 / cryptroot1 — NOT nvmeXp3
-blkid /dev/nvme0n1p3                  # TYPE="crypto_LUKS"
-cat /proc/mdstat                      # md2 and md3 both [UU]
-findmnt -no SOURCE /
+#   the array under / must have cryptroot0 / cryptroot1 as children — NOT nvmeXnYpZ
+blkid -t TYPE=crypto_LUKS             # both payload partitions, one per disk
+cat /proc/mdstat                      # every array [UU]
+findmnt -no SOURCE /                  # /dev/md/cmeshroot (or its mdNNN alias)
 
 # Swap is on the encrypted volume, not a bare partition:
 swapon --show                         # NAME must be /swap/swapfile
-findmnt -no SOURCE -T /swap/swapfile  # must resolve through md3
+findmnt -no SOURCE -T /swap/swapfile  # must resolve to the same array as /
 ls -l /swap/swapfile                  # 0600 root:root
 ```
 
@@ -374,8 +415,9 @@ equivalent, so copy the header and keyslot area directly. Measured: the keyslot 
 fixed — it does not scale with the device, so 32 MiB covers it:
 
 ```bash
-dd if=/dev/nvme0n1p3 of=/root/luks-header-nvme0n1p3.img bs=1M count=32
-dd if=/dev/nvme1n1p3 of=/root/luks-header-nvme1n1p3.img bs=1M count=32
+for p in $(blkid -o device -t TYPE=crypto_LUKS); do
+    dd if="$p" of="/root/luks-header-$(basename "$p").img" bs=1M count=32
+done
 ```
 
 Store them off-host; a header plus the passphrase decrypts everything. Test the restore
