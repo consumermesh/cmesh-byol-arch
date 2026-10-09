@@ -555,6 +555,36 @@ check "an undecryptable alert is NOT marked read" "" "$(grep -o '20261009T160000
 CMESH_ALERT_S3_BUCKET="" "$POLLER" >/dev/null 2>&1
 check "a missing bucket is a hard error, not a silent no-op" 1 $?
 
+# --env has to be read before the defaults are resolved. It was not, once: every name
+# the file carried was already bound, so the flag did nothing and the run died on
+# "CMESH_ALERT_S3_ENDPOINT is not set" instead of reading the config.
+cat > "$PL/curl" <<'PCURL'
+#!/bin/bash
+printf '%s\n' "$*" >> "$CURL_LOG"
+PCURL
+chmod +x "$PL/curl"
+export CURL_LOG="$PL/curl.log"
+cat > "$PL/poller.env" <<PENV
+CMESH_ALERT_S3_ENDPOINT=us-east-1.linodeobjects.com
+CMESH_ALERT_S3_BUCKET=cmeshai-backups
+CMESH_ALERT_AGE_IDENTITY=$PL/identity
+CMESH_ALERT_STATE=$PL/state2
+CMESH_ALERT_AWS=$PL/aws
+CMESH_ALERT_AGE=$PL/age
+CMESH_ALERT_CURL=$PL/curl
+CMESH_ALERT_NTFY_TOPIC=file-topic
+PENV
+: > "$CURL_LOG"
+out=$(env -u CMESH_ALERT_S3_ENDPOINT -u CMESH_ALERT_S3_BUCKET -u CMESH_ALERT_AGE_IDENTITY \
+        -u CMESH_ALERT_STATE -u CMESH_ALERT_AWS -u CMESH_ALERT_AGE -u CMESH_ALERT_CURL \
+        -u CMESH_ALERT_NTFY_TOPIC \
+        "$POLLER" --env "$PL/poller.env" 2>&1)
+check "--env is read before the defaults (it used to be a no-op)" yes "$(printf '%s' "$out" | grep -q 'marshall-live: 2 hard errors' && echo yes || echo no)"
+check "a topic set in the file is used" yes "$(grep -q 'ntfy.sh/file-topic' "$CURL_LOG" && echo yes || echo no)"
+rm -rf "$PL/state2"; : > "$CURL_LOG"
+env -u CMESH_ALERT_NTFY_TOPIC "$POLLER" --env "$PL/poller.env" --ntfy cmdline-topic >/dev/null 2>&1
+check "--ntfy on the command line beats the file" yes "$(grep -q 'ntfy.sh/cmdline-topic' "$CURL_LOG" && echo yes || echo no)"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

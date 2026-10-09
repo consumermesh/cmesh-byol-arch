@@ -29,11 +29,39 @@
 #   scripts/cmesh-alert-poller --all           # print everything, ignore the seen list
 #   scripts/cmesh-alert-poller --ntfy TOPIC    # print and push
 #   scripts/cmesh-alert-poller --dry-run       # list what would be read, change nothing
+#   scripts/cmesh-alert-poller --env ~/.config/cmesh-alert/poller.env
+#
+# --env FILE is read before the defaults are resolved, so it can set any of them;
+# --ntfy on the command line overrides the file.
 #
 # Run it on a timer -- a systemd --user timer or a cron entry -- so a notification
 # arrives without you asking. Anything it cannot decrypt is left unread and the exit
 # status is non-zero, so the failure is visible rather than a silently skipped alert.
 set -uo pipefail
+
+# Arguments are read FIRST, because --env has to land before the defaults below are
+# resolved: sourcing it after them sets nothing, since every name it carries is already
+# bound. --ntfy is held aside so the command line still beats the file.
+ENV_FILE=""
+ARG_NTFY=""
+ALL=0; DRY=0; LIMIT=50
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --all)      ALL=1 ;;
+        --dry-run)  DRY=1 ;;
+        --limit)    LIMIT="${2:?--limit needs a number}"; shift ;;
+        --ntfy)     ARG_NTFY="${2:?--ntfy needs a topic}"; shift ;;
+        --env)      ENV_FILE="${2:?--env needs a file}"; shift ;;
+        -h|--help)  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)          echo "unknown argument: $1" >&2; exit 64 ;;
+    esac
+    shift
+done
+if [ -n "$ENV_FILE" ]; then
+    [ -r "$ENV_FILE" ] || { echo "no such env file: ${ENV_FILE}" >&2; exit 66; }
+    # shellcheck source=/dev/null
+    . "$ENV_FILE"
+fi
 
 ENDPOINT="${CMESH_ALERT_S3_ENDPOINT:-}"
 BUCKET="${CMESH_ALERT_S3_BUCKET:-}"
@@ -43,24 +71,8 @@ STATE="${CMESH_ALERT_STATE:-${XDG_CACHE_HOME:-$HOME/.cache}/cmesh-alert}"
 AWS="${CMESH_ALERT_AWS:-aws}"
 AGE="${CMESH_ALERT_AGE:-age}"
 CURL="${CMESH_ALERT_CURL:-curl}"
-NTFY_TOPIC="${CMESH_ALERT_NTFY_TOPIC:-}"
+NTFY_TOPIC="${ARG_NTFY:-${CMESH_ALERT_NTFY_TOPIC:-}}"
 NTFY_HOST="${CMESH_ALERT_NTFY_HOST:-ntfy.sh}"
-
-ALL=0; DRY=0; LIMIT=50
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --all)      ALL=1 ;;
-        --dry-run)  DRY=1 ;;
-        --limit)    LIMIT="${2:?--limit needs a number}"; shift ;;
-        --ntfy)     NTFY_TOPIC="${2:?--ntfy needs a topic}"; shift ;;
-        --env)      # shellcheck source=/dev/null
-                    [ -r "${2:?--env needs a file}" ] || { echo "no such env file: $2" >&2; exit 66; }
-                    . "$2"; shift ;;
-        -h|--help)  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *)          echo "unknown argument: $1" >&2; exit 64 ;;
-    esac
-    shift
-done
 
 die() { echo "cmesh-alert-poller: $*" >&2; exit 1; }
 
