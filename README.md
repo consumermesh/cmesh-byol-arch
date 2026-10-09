@@ -478,6 +478,47 @@ host, decrypts with the age identity that never touches the server, and can forw
 ntfy, mail or a pager from there — so the public-service hop originates outside the PHI
 boundary. Run it from a `systemd --user` timer or a cron entry on your workstation.
 
+#### Wiring it up, end to end
+
+Once, on your workstation — the keypair must not be generated on the server:
+
+```bash
+pacman -S age aws-cli
+mkdir -p ~/.age && age-keygen -o ~/.age/marshall-alert-identity.txt && chmod 600 ~/.age/marshall-alert-identity.txt
+grep '^# public key:' ~/.age/marshall-alert-identity.txt | cut -d' ' -f4     # the recipient
+```
+
+On the server — `LINODE_S3_ENDPOINT`/`LINODE_S3_BUCKET` are the backup ones; the same
+credentials file is reused, and only its `AWS_*` lines are read:
+
+```bash
+sudo install -d -m 0755 /etc/cmesh-byol
+echo 'age1…' | sudo tee /etc/cmesh-byol/alert-recipients.txt
+sudoedit /etc/cmesh-byol/alert.env      # template: /etc/cmesh-byol/alert.env.example
+```
+
+```ini
+CMESH_ALERT_DELIVERY=s3
+CMESH_ALERT_S3_ENDPOINT=us-east-1.linodeobjects.com
+CMESH_ALERT_S3_BUCKET=cmeshai-backups
+CMESH_ALERT_S3_PREFIX=alerts
+CMESH_ALERT_AGE_RECIPIENTS=/etc/cmesh-byol/alert-recipients.txt
+CMESH_ALERT_CREDENTIALS_FILE=/etc/marshall/backup.env
+```
+
+```bash
+sudo /usr/local/sbin/cmesh-alert test "delivery check"     # journal + log + one object
+sudo systemctl enable --now cmesh-logwatch.timer certbot-renew.timer
+sudo systemctl start cmesh-logwatch.service                # prime now, not in 5 minutes
+sudo /usr/local/sbin/cmesh-byol-harden --status            # delivery + last scan
+```
+
+On the workstation, `~/.config/cmesh-alert/poller.env` (mode `0600`) holds the same
+endpoint and bucket, the identity path, and a long random ntfy topic; then a `--user`
+timer runs `cmesh-alert-poller --env … --ntfy TOPIC` every five minutes. Subscribe to that
+topic in the ntfy app, and `loginctl enable-linger $USER` so it runs when you are logged
+out. The topic is the only secret: treat it as a password, or self-host ntfy.
+
 ### On a server that is already installed
 
 No reinstall. Copy the script and its files, run it as root, and keep that session open
