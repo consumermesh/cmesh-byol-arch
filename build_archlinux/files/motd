@@ -1,21 +1,19 @@
 
-                   -`
-                  .o+`                   Arch Linux  ·  cmesh BYOL
-                 `ooo/
-                `+oooo:                  root     LUKS2 aes-xts-plain64 · RAID1 · md/cmeshroot
-               `+oooooo:                 unlock   TPM2 (PCR 7), passphrase as rescue
-               -+oooooo+:                /boot    unencrypted, shared with the bootstrap
-             `/:-:++oooo+:               rescue   bootstrap root stays on p3 (ext4, dormant)
-            `/++++/+++++++:
-           `/++++++++++++++:             logs     /var/log/cmesh-byol-install.log
-          `/+++ooooooooooooo/`                    /var/log/cmesh-byol-finalize.log
-         ./ooosssso++osssssso+`                   /var/log/ovh-make-bootable.log  (bootstrap root)
-        .oossssso-````/ossssss+`
-       -osssssso.      :ssssssso.        check    cryptsetup status cryptroot0
-      :osssssss/        osssso+++.                systemd-cryptenroll /dev/nvme0n1p4
-     /ossssssss/        +ssssooo/-                cat /proc/mdstat
-   `/ossssso+/:-        -:/+osssso+-
-  `+sso+:-`                 `.-/+oso:    docs     https://github.com/consumermesh/cmesh-byol-arch
- `++:.                           `-/+/
- .`                                 `/
-
+[0m              [38;2;9;59;70m######[0m
+[0m         [38;2;8;62;77m#######[0moo[38;2;8;62;77m#######[0m                [1m[38;2;0;124;190mMarshall[0m  ·  Arch Linux[0m
+[0m    [38;2;8;66;83m#######[0moooooooooooo[38;2;8;66;83m#######[0m
+[0m   [38;2;7;69;90m###[0moooooooooooooooooooooo[38;2;7;69;90m###[0m          root     LUKS2 aes-xts-plain64 · RAID1 · md/cmeshroot[0m
+[0m   [38;2;7;73;96m##[0moooooooooooooooooooooooo[38;2;7;73;96m##[0m          unlock   TPM2 (PCR 7), passphrase as rescue[0m
+[0m   [38;2;6;76;103m##[0moooooooooooooooooooooooo[38;2;6;76;103m##[0m          /boot    unencrypted, shared with the bootstrap[0m
+[0m   [38;2;6;80;109m##[0mooooo   oooooooo   ooooo[38;2;6;80;109m##[0m          rescue   bootstrap root stays on p3 (ext4, dormant)[0m
+[0m   [38;2;5;83;116m##[0mooooo    oooooo    ooooo[38;2;5;83;116m##[0m
+[0m   [38;2;5;87;122m##[0mooooo     oooo     ooooo[38;2;5;87;122m##[0m          logs     /var/log/cmesh-byol-install.log[0m
+[0m   [38;2;4;90;128m##[0mooooo  oo  oo  oo  ooooo[38;2;4;90;128m##[0m                   /var/log/cmesh-byol-finalize.log[0m
+[0m   [38;2;4;94;135m##[0mooooo  ooo    ooo  ooooo[38;2;4;94;135m##[0m                   /var/log/ovh-make-bootable.log  (bootstrap root)[0m
+[0m    [38;2;4;98;141m##[0moooo  oooo  oooo  oooo[38;2;4;98;141m##[0m
+[0m    [38;2;3;101;148m###[0mooo  oooooooooo  ooo[38;2;3;101;148m###[0m           check    cryptsetup status cryptroot0[0m
+[0m     [38;2;3;105;154m###[0moooooooooooooooooo[38;2;3;105;154m###[0m                     systemd-cryptenroll /dev/nvme0n1p4[0m
+[0m       [38;2;2;108;161m###[0moooooooooooooo[38;2;2;108;161m###[0m                       cat /proc/mdstat[0m
+[0m         [38;2;2;112;167m###[0moooooooooo[38;2;2;112;167m###[0m
+[0m           [38;2;1;115;174m#####[0moo[38;2;1;115;174m#####[0m                  docs     https://github.com/consumermesh/cmesh-byol-arch[0m
+[0m              [38;2;1;119;180m######[0m

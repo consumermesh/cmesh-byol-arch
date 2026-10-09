@@ -175,7 +175,8 @@ install -Dm644 "$FILES_SRC/cmesh-byol-install.service" \
 install -Dm644 "$FILES_SRC/cmesh-byol-finalize.service" \
     /etc/systemd/system/cmesh-byol-finalize.service
 
-# Login banner: the Arch logo plus what this machine is and where its logs are. Shown
+# Login banner: the Marshall shield mark (drawn from marshall-microsites
+# packages/ui/components/Mark.astro) plus what this machine is and where its logs are. Shown
 # by pam_motd on SSH and console logins (Arch's sshd_config has PrintMotd no and leaves
 # it to PAM). Optional: a missing file costs a banner, not a build. The installer rsyncs
 # /etc into the encrypted system, so it carries over.
