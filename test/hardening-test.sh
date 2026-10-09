@@ -20,6 +20,7 @@ HARDEN="$REPO/build_archlinux/files/cmesh-byol-harden"
 H="$REPO/build_archlinux/files/hardening"
 PROVISION="$REPO/build_archlinux/provision.sh"
 INSTALLER="$REPO/build_archlinux/files/cmesh-byol-install"
+POLLER="$REPO/scripts/cmesh-alert-poller"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 PASS=0
@@ -42,7 +43,8 @@ before() { # before <file> <pattern-a> <pattern-b>
 }
 
 echo "(1) scripts parse"
-for f in "$HARDEN" "$H/cmesh-alert" "$H/cmesh-integrity" "$H/cmesh-arch-audit"; do
+for f in "$HARDEN" "$H/cmesh-alert" "$H/cmesh-integrity" "$H/cmesh-arch-audit" \
+         "$H/cmesh-logwatch" "$H/cmesh-unit-failed" "$POLLER"; do
     bash -n "$f" 2>/dev/null; check "bash -n $(basename "$f")" 0 $?
     check "$(basename "$f") is executable" yes "$([ -x "$f" ] && echo yes || echo no)"
 done
@@ -217,7 +219,10 @@ rm -f "$WORK/state/manifest.sha256"
 
 echo
 echo "(10) cmesh-alert routes every caller to one log"
-export CMESH_ALERT_LOG="$WORK/alerts.log"
+# CMESH_ALERT_CONFIG pins the delivery config away from whatever this machine has:
+# without it, a developer box with /etc/cmesh-byol/alert.env would have the suite
+# uploading objects to a bucket.
+export CMESH_ALERT_LOG="$WORK/alerts.log" CMESH_ALERT_CONFIG=/dev/null
 "$H/cmesh-alert" integrity "manual message" >/dev/null 2>&1
 check "generic: [source] message" yes "$(grep -q '\[integrity\] manual message$' "$CMESH_ALERT_LOG" && echo yes || echo no)"
 "$H/cmesh-alert" DegradedArray /dev/md127 >/dev/null 2>&1
@@ -331,6 +336,224 @@ printf 'not a PE at all' > "$WORK/text.bin"
 "$H/cmesh-esp-sync" check "$WORK/nonexistent";  check "missing file: 2" 2 $?
 export CMESH_ESP_LABEL=NO_SUCH_LABEL_$$ CMESH_UKI="$WORK/signed.efi"
 "$H/cmesh-esp-sync" sync >/dev/null 2>&1;       check "sync without the prepared marker is a no-op (0)" 0 $?
+
+echo
+echo "(15) cmesh-logwatch: journal errors alert, journal text never leaves"
+# Everything cmesh-logwatch shells out to is stubbed, so this runs anywhere -- the same
+# reason cmesh-integrity takes CMESH_INTEGRITY_*. The stub alert records the source and
+# the message it was handed, which is what makes the PHI assertion below possible: the
+# canned journal line contains a patient id and an SSN, and no assertion here would
+# catch them leaking if the alert simply quoted the line.
+LW="$WORK/lw"; mkdir -p "$LW"
+cat > "$LW/alert" <<'LALERT'
+#!/bin/bash
+printf '%s\n' "$*" >> "$ALERT_OUT"
+LALERT
+cat > "$LW/journalctl" <<'LJL'
+#!/bin/bash
+[ -n "${FAKE_JOURNAL:-}" ] && cat "$FAKE_JOURNAL"
+[ -n "${FAKE_JOURNAL_FAIL:-}" ] && exit 3
+exit 0
+LJL
+cat > "$LW/systemctl" <<'LSC'
+#!/bin/bash
+case "$1" in
+    --failed) printf '%s\n' "${FAKE_FAILED:-}" ;;
+    show) case "$*" in
+              *NRestarts*)      printf '%s\n' "${FAKE_RESTARTS:-0}" ;;
+              *Result*)         printf '%s\n' "${FAKE_RESULT:-exit-code}" ;;
+              *ExecMainStatus*) printf '%s\n' "${FAKE_STATUS:-1}" ;;
+          esac ;;
+esac
+LSC
+cat > "$LW/openssl" <<'LOS'
+#!/bin/bash
+case "$*" in
+    *-enddate*)  [ -n "${FAKE_CERT_UNREADABLE:-}" ] && exit 1
+                 printf 'notAfter=%s\n' "${FAKE_NOTAFTER:-Nov  1 00:00:00 2026 GMT}" ;;
+    *-checkend*) [ -n "${FAKE_CERT_OLD:-}" ] && exit 1; exit 0 ;;
+esac
+LOS
+chmod +x "$LW/alert" "$LW/journalctl" "$LW/systemctl" "$LW/openssl"
+export ALERT_OUT="$LW/alerts" CMESH_LOGWATCH_STATE="$LW/state" CMESH_LOGWATCH_ALERT="$LW/alert" \
+       CMESH_LOGWATCH_JOURNALCTL="$LW/journalctl" CMESH_LOGWATCH_SYSTEMCTL="$LW/systemctl" \
+       CMESH_LOGWATCH_OPENSSL="$LW/openssl" CMESH_LOGWATCH_CERTDIR="$LW/certs" \
+       CMESH_LOGWATCH_UNITS="marshall-live"
+lw_reset() { rm -rf "$LW/state"; : > "$ALERT_OUT"; }
+lw() { "$H/cmesh-logwatch" >/dev/null 2>&1; }
+
+lw_reset
+printf '%s\n' '** (exit) an exception was raised: patient 40912 record ss 123-45-6789' > "$LW/journal"
+export FAKE_JOURNAL="$LW/journal"
+lw
+check "a first scan primes the window (install-day noise is not an alert)" 0 "$(wc -l < "$ALERT_OUT")"
+lw
+check "a hard error raises exactly one alert" 1 "$(wc -l < "$ALERT_OUT")"
+check "the alert names the class, not the line" yes "$(grep -q 'process-exit=1' "$ALERT_OUT" && echo yes || echo no)"
+check "the alert carries the journalctl command to read the detail" yes "$(grep -q 'journalctl -u marshall-live --since' "$ALERT_OUT" && echo yes || echo no)"
+check "NO journal text in the alert (patient id, SSN, exception text)" 0 "$(grep -c '40912\|123-45-6789\|exception was raised' "$ALERT_OUT")"
+lw
+check "the same class does not re-alert inside the repeat window" 1 "$(wc -l < "$ALERT_OUT")"
+
+lw_reset
+: > "$FAKE_JOURNAL"
+printf 'a benign err line\na second one\n' > "$LW/journal"
+lw; lw
+check "err lines below ERR_MAX do not alert" 0 "$(wc -l < "$ALERT_OUT")"
+CMESH_LOGWATCH_ERR_MAX=2 lw
+check "a burst at ERR_MAX does alert" 1 "$(wc -l < "$ALERT_OUT")"
+check "the burst is reported by count, not by quoting" yes "$(grep -q 'unclassified=2' "$ALERT_OUT" && echo yes || echo no)"
+
+lw_reset
+: > "$LW/journal"
+# The leading marker is what systemctl writes when stdout is not a tty, which is how a
+# systemd unit always sees it -- parsing field 1 would take the bullet, not the unit.
+FAKE_FAILED="* marshall-live.service loaded failed failed Marshall Live Server" lw
+check "a unit in the failed state alerts on the first run (nothing to prime)" 1 "$(wc -l < "$ALERT_OUT")"
+check "the unit name is parsed past systemctl's non-tty bullet" yes "$(grep -q 'marshall-live.service is in the failed state' "$ALERT_OUT" && echo yes || echo no)"
+FAKE_FAILED="* marshall-live.service loaded failed failed Marshall Live Server" lw
+check "a unit that stays failed does not nag every five minutes" 1 "$(wc -l < "$ALERT_OUT")"
+
+lw_reset
+FAKE_RESTARTS=0 lw
+check "a stable restart count stays quiet" 0 "$(wc -l < "$ALERT_OUT")"
+FAKE_RESTARTS=2 lw
+check "an increased restart count alerts" 1 "$(wc -l < "$ALERT_OUT")"
+check "the restart alert reports the delta and the total" yes "$(grep -q 'auto-restarted 2 time(s).*(2 total)' "$ALERT_OUT" && echo yes || echo no)"
+
+lw_reset
+mkdir -p "$LW/certs/model.marshall.work"; : > "$LW/certs/model.marshall.work/fullchain.pem"
+lw
+check "a certificate outside the window stays quiet" 0 "$(wc -l < "$ALERT_OUT")"
+lw_reset
+FAKE_CERT_OLD=1 lw
+check "a certificate inside the window alerts with its notAfter" yes "$(grep -q 'expires within 21 days (Nov  1 00:00:00 2026 GMT)' "$ALERT_OUT" && echo yes || echo no)"
+check "the expiry alert names the certbot command to check" yes "$(grep -q 'certbot-renew.timer && certbot certificates' "$ALERT_OUT" && echo yes || echo no)"
+lw_reset
+FAKE_CERT_UNREADABLE=1 lw
+check "an unreadable certificate is its own alert, not a guessed expiry" yes "$(grep -q 'cannot read the TLS certificate' "$ALERT_OUT" && echo yes || echo no)"
+
+lw_reset
+mkdir -p "$LW/state"
+printf '1000000000\n' > "$LW/state/marshall-live.last"
+FAKE_JOURNAL_FAIL=1 lw
+check "a failed journalctl read leaves the window open (its errors are not lost)" 1000000000 "$(cat "$LW/state/marshall-live.last")"
+lw_reset
+mkdir -p "$LW/state"
+printf '1000000000\n' > "$LW/state/marshall-live.last"
+printf '=CRASH REPORT==== 9-Oct-2026\n' > "$LW/journal"
+lw
+check "a long downtime does not replay a week of errors (window is capped)" yes "$(grep -q "since $(date -Is | cut -c1-4)" "$ALERT_OUT" && echo yes || echo no)"
+
+: > "$ALERT_OUT"
+CMESH_ALERT_BIN="$LW/alert" CMESH_UNIT_FAILED_SYSTEMCTL="$LW/systemctl" "$H/cmesh-unit-failed" marshall-live
+check "cmesh-unit-failed exits 0 (a failed alert must not fail its caller)" 0 $?
+check "it names the unit as the alert source" yes "$(grep -q '^marshall-live ' "$ALERT_OUT" && echo yes || echo no)"
+check "it reports the unit, result, exit status and restarts" yes "$(grep -q 'marshall-live.service FAILED (result=exit-code exit=1 restarts=' "$ALERT_OUT" && echo yes || echo no)"
+CMESH_ALERT_BIN="$LW/alert" "$H/cmesh-unit-failed" >/dev/null 2>&1
+check "a missing unit argument exits 64" 64 $?
+check "cmesh-alert@.service runs cmesh-unit-failed with the instance name" yes "$(has "$H/cmesh-alert@.service" 'ExecStart=/usr/local/sbin/cmesh-unit-failed %i')"
+
+echo
+echo "(16) cmesh-alert delivery: off by default, never fatal, never plaintext"
+DL="$WORK/dl"; mkdir -p "$DL"
+cat > "$DL/aws" <<'DAWS'
+#!/bin/bash
+echo "$*" >> "$AWS_LOG"
+DAWS
+cat > "$DL/age" <<'DAGE'
+#!/bin/bash
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+[ -n "$out" ] && cp "${!#}" "$out"
+DAGE
+cat > "$DL/agefail" <<'DAGEFAIL'
+#!/bin/bash
+echo "age: no identity matched any of the recipients" >&2
+exit 1
+DAGEFAIL
+chmod +x "$DL/aws" "$DL/age" "$DL/agefail"
+printf 'age1testrecipient\n' > "$DL/recipients"
+export CMESH_ALERT_LOG="$DL/alerts.log" CMESH_ALERT_AWS="$DL/aws" CMESH_ALERT_AGE="$DL/age" AWS_LOG="$DL/aws.log"
+: > "$AWS_LOG"
+CMESH_ALERT_CONFIG=/dev/null "$H/cmesh-alert" logwatch "unit X: 1 hard error" >/dev/null 2>&1
+check "with no config nothing is sent, and the caller still succeeds" 0 "$(wc -l < "$AWS_LOG")"
+check "with no config the alert is still on the box" yes "$(grep -q 'unit X: 1 hard error' "$CMESH_ALERT_LOG" && echo yes || echo no)"
+CMESH_ALERT_CONFIG=/dev/null CMESH_ALERT_DELIVERY=s3 "$H/cmesh-alert" logwatch "unit X: 1 hard error" >/dev/null 2>&1
+check "delivery=s3 with no bucket stays local instead of failing" 0 "$(wc -l < "$AWS_LOG")"
+
+cat > "$DL/alert.env" <<DENV
+CMESH_ALERT_DELIVERY=s3
+CMESH_ALERT_S3_ENDPOINT=us-east-1.linodeobjects.com
+CMESH_ALERT_S3_BUCKET=cmeshai-backups
+CMESH_ALERT_S3_PREFIX=alerts
+CMESH_ALERT_AGE_RECIPIENTS=$DL/recipients
+CMESH_ALERT_CREDENTIALS_FILE=$DL/creds.env
+DENV
+CMESH_ALERT_CONFIG="$DL/alert.env" "$H/cmesh-alert" logwatch "unit X: 1 hard error" >/dev/null 2>&1
+check "an unreadable credentials file stays local instead of shipping" 0 "$(wc -l < "$AWS_LOG")"
+printf 'AWS_ACCESS_KEY_ID=AKIATEST\nAWS_SECRET_ACCESS_KEY=x\nUNRELATED=nothing\n' > "$DL/creds.env"
+CMESH_ALERT_CONFIG="$DL/alert.env" "$H/cmesh-alert" logwatch "unit X: 1 hard error" >/dev/null 2>&1
+check "a configured host uploads exactly one object" 1 "$(wc -l < "$AWS_LOG")"
+check "the object lands under the prefix and host" yes "$(grep -q 's3://cmeshai-backups/alerts/[^/]*/20[0-9]*T[0-9]*Z-[0-9]*-logwatch\.json\.age' "$AWS_LOG" && echo yes || echo no)"
+check "the endpoint is object storage, not AWS itself" yes "$(grep -q -- '--endpoint-url https://us-east-1.linodeobjects.com' "$AWS_LOG" && echo yes || echo no)"
+before=$(wc -l < "$AWS_LOG")
+CMESH_ALERT_CONFIG="$DL/alert.env" CMESH_ALERT_AGE="$DL/agefail" "$H/cmesh-alert" logwatch "unit X" >/dev/null 2>&1
+check "an age failure uploads nothing (no plaintext object)" "$before" "$(wc -l < "$AWS_LOG")"
+
+echo
+echo "(17) the installer wires all of it"
+check "the logwatch timer is enabled" yes "$(has "$HARDEN" 'cmesh-logwatch.timer cmesh-byol-secureboot-finish.service')"
+check "the logwatch timer is started, not just enabled" yes "$(has "$HARDEN" 'cmesh-integrity.timer cmesh-logwatch.timer systemd-timesyncd.service')"
+for u in httpd marshall-model marshall-live certbot-renew cmesh-logwatch; do
+    check "OnFailure is wired for ${u}" yes "$(has "$HARDEN" 'OnFailure=cmesh-alert@\$\{u\}\.service')"
+done
+check "the OnFailure drop-in is not written for a unit that does not exist" yes "$(has "$HARDEN" 'no \$\{u\}\.service on this host; nothing to wire')"
+check "a configured alert.env is never clobbered" yes "$(has "$HARDEN" 'kept /etc/cmesh-byol/alert.env')"
+check "an unconfigured host is seeded from the template, 0600" yes "$(has "$HARDEN" 'install -m 0600 "\$FILES/cmesh-alert.env.example" /etc/cmesh-byol/alert.env')"
+check "the poller is not installed on the server" "" "$(code "$HARDEN" | grep -E '^put ' | awk '$2 ~ /poller/ {print $2}')"
+
+echo
+echo "(18) cmesh-alert-poller: reads the dead-drop, and never loses one it cannot read"
+PL="$WORK/pl"; mkdir -p "$PL"
+cat > "$PL/aws" <<'PAWS'
+#!/bin/bash
+case "$1$2" in
+    s3ls) printf '%s\n' "${FAKE_LISTING:-}" ;;
+    s3cp) cat "${FAKE_OBJECT:?}" ;;
+esac
+PAWS
+cat > "$PL/age" <<'PAGE'
+#!/bin/bash
+[ -n "${FAKE_UNDECRYPTABLE:-}" ] && { echo "age: no identity matched" >&2; exit 1; }
+cat "${FAKE_PLAIN:?}"
+PAGE
+chmod +x "$PL/aws" "$PL/age"
+printf 'AGE-SECRET-KEY-1TEST\n' > "$PL/identity"
+printf 'ciphertext' > "$PL/object"
+printf '{"ts":"2026-10-09T16:00:00-04:00","host":"msh-ca-21","source":"logwatch","message":"marshall-live: 2 hard errors"}\n' > "$PL/plain"
+export CMESH_ALERT_S3_ENDPOINT=us-east-1.linodeobjects.com CMESH_ALERT_S3_BUCKET=cmeshai-backups \
+       CMESH_ALERT_AGE_IDENTITY="$PL/identity" CMESH_ALERT_STATE="$PL/state" \
+       CMESH_ALERT_AWS="$PL/aws" CMESH_ALERT_AGE="$PL/age" \
+       FAKE_OBJECT="$PL/object" FAKE_PLAIN="$PL/plain" \
+       FAKE_LISTING="2026-10-09 16:00:00 100 alerts/msh-ca-21/20261009T160000Z-1-logwatch.json.age"
+out=$("$POLLER" 2>&1)
+check "a new alert is printed" yes "$(printf '%s' "$out" | grep -q 'marshall-live: 2 hard errors' && echo yes || echo no)"
+out=$("$POLLER" 2>&1)
+check "the same object is not printed twice" yes "$(printf '%s' "$out" | grep -q 'no new alerts' && echo yes || echo no)"
+out=$("$POLLER" --all 2>&1)
+check "--all re-reads what is already marked read" yes "$(printf '%s' "$out" | grep -q 'marshall-live: 2 hard errors' && echo yes || echo no)"
+rm -rf "$PL/state"
+out=$("$POLLER" --dry-run 2>&1)
+check "--dry-run lists what a real run would read" yes "$(printf '%s' "$out" | grep -q 'would read s3://cmeshai-backups/alerts/msh-ca-21/' && echo yes || echo no)"
+out=$("$POLLER" 2>&1)
+check "--dry-run consumed nothing (the next real run still reads it)" yes "$(printf '%s' "$out" | grep -q 'marshall-live: 2 hard errors' && echo yes || echo no)"
+rm -rf "$PL/state"
+FAKE_UNDECRYPTABLE=1 "$POLLER" >/dev/null 2>&1
+check "an undecryptable alert fails loudly instead of being skipped" 1 $?
+check "an undecryptable alert is NOT marked read" "" "$(grep -o '20261009T160000Z-1' "$PL/state/seen" 2>/dev/null)"
+CMESH_ALERT_S3_BUCKET="" "$POLLER" >/dev/null 2>&1
+check "a missing bucket is a hard error, not a silent no-op" 1 $?
 
 echo
 echo "passed: $PASS  failed: $FAIL"

@@ -1,0 +1,12 @@
+[Unit]
+Description=cmesh: scan the journal for hard errors in watched units
+Documentation=file:/usr/local/sbin/cmesh-logwatch
+# A non-zero exit means the scan could not run at all (state directory unwritable,
+# alert sink missing) -- not that it found errors. Found errors go through
+# cmesh-alert, so that a broken monitor is the only thing that fails the unit.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cmesh-logwatch
+Nice=10
+IOSchedulingClass=idle

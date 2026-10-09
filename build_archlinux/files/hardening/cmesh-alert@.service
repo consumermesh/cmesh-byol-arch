@@ -1,0 +1,9 @@
+[Unit]
+Description=cmesh alert: %i entered the failed state
+Documentation=file:/usr/local/sbin/cmesh-unit-failed
+# Started by the 50-cmesh-onfailure.conf drop-in that cmesh-byol-harden writes into
+# the watched unit's directory. %i is the watched unit's name, without ".service".
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cmesh-unit-failed %i

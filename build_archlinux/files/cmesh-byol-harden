@@ -55,7 +55,7 @@ PKGS=(nftables audit sshguard smartmontools arch-audit sudo apparmor openssh mda
 UNITS=(nftables.service auditd.service sshguard.service smartd.service
        apparmor.service systemd-timesyncd.service
        cmesh-arch-audit.timer cmesh-integrity.timer cmesh-integrity-init.service
-       cmesh-byol-secureboot-finish.service)
+       cmesh-logwatch.timer cmesh-byol-secureboot-finish.service)
 
 ### --status: read-only report ########################################################
 
@@ -92,6 +92,8 @@ status() {
     echo "kernel cmdline: $(grep -oE 'lsm=\S+|audit=\S+' /proc/cmdline | tr '\n' ' ')"
     echo "integrity:  baseline $(cat /var/lib/cmesh-byol/integrity/baseline-at 2>/dev/null || echo 'NONE')"
     echo "alerts:     $(wc -l < /var/log/cmesh-alerts.log 2>/dev/null || echo 0) lines in /var/log/cmesh-alerts.log; last: $(tail -1 /var/log/cmesh-alerts.log 2>/dev/null | cut -c1-100)"
+    echo "delivery:   $(grep -hE '^CMESH_ALERT_DELIVERY=' /etc/cmesh-byol/alert.env 2>/dev/null || echo 'alert.env MISSING')"
+    echo "logwatch:   last scan $(cat /var/lib/cmesh-byol/logwatch/last-run 2>/dev/null || echo 'NEVER')  (ISO timestamp, alerts raised)"
     echo "mdstat:     $(grep -E '^md' /proc/mdstat 2>/dev/null | awk '{print $1":"$4}' | tr '\n' ' ')"
 }
 if [ "$STATUS" -eq 1 ]; then status; exit 0; fi
@@ -165,12 +167,31 @@ put cmesh-integrity.timer         /etc/systemd/system/cmesh-integrity.timer    0
 put cmesh-integrity-init.service  /etc/systemd/system/cmesh-integrity-init.service 0644
 put cmesh-arch-audit.service      /etc/systemd/system/cmesh-arch-audit.service 0644
 put cmesh-arch-audit.timer        /etc/systemd/system/cmesh-arch-audit.timer   0644
+put cmesh-logwatch                /usr/local/sbin/cmesh-logwatch               0755
+put cmesh-unit-failed             /usr/local/sbin/cmesh-unit-failed            0755
+put cmesh-logwatch.service        /etc/systemd/system/cmesh-logwatch.service   0644
+put cmesh-logwatch.timer          /etc/systemd/system/cmesh-logwatch.timer     0644
+put cmesh-alert@.service          /etc/systemd/system/cmesh-alert@.service     0644
+put cmesh-alert.env.example       /etc/cmesh-byol/alert.env.example            0644
 put pacman-cmesh-integrity.hook   /etc/pacman.d/hooks/90-cmesh-integrity.hook  0644
 put cmesh-byol-secureboot         /usr/local/sbin/cmesh-byol-secureboot        0755
 put cmesh-esp-sync                /usr/local/sbin/cmesh-esp-sync               0755
 put initcpio-post-cmesh-esp-sync  /etc/initcpio/post/zz-cmesh-esp-sync         0755
 put pacman-cmesh-esp-sync.hook    /etc/pacman.d/hooks/zzz-cmesh-esp-sync.hook  0644
 put cmesh-byol-secureboot-finish.service /etc/systemd/system/cmesh-byol-secureboot-finish.service 0644
+
+# The alert delivery config is the one file a re-run must NOT clobber: it names the
+# bucket, the credentials file and the age recipients. Ship the template every time so
+# the comments stay current, and seed the live file only on a host that has none --
+# seeding it is what turns delivery from "off" into whatever the operator chose.
+install -d -m 0755 /etc/cmesh-byol
+if [ -f /etc/cmesh-byol/alert.env ]; then
+    ok "kept /etc/cmesh-byol/alert.env (already configured)"
+else
+    install -m 0600 "$FILES/cmesh-alert.env.example" /etc/cmesh-byol/alert.env
+    ok "installed /etc/cmesh-byol/alert.env (delivery off until you edit it)"
+fi
+chmod 0600 /etc/cmesh-byol/alert.env
 
 # The sudo I/O log directory and the alert log must not be world-readable.
 install -d -m 0700 /var/log/sudo-io
@@ -211,6 +232,42 @@ if ! grep -qE '^PROGRAM\s+/usr/local/sbin/cmesh-alert' /etc/mdadm.conf 2>/dev/nu
     printf 'PROGRAM /usr/local/sbin/cmesh-alert\n' >> /etc/mdadm.conf
 fi
 ok "mdadm.conf: PROGRAM /usr/local/sbin/cmesh-alert"
+
+# Unit failures: hand them to cmesh-alert the moment systemd gives up on them.
+#
+# OnFailure fires only when a unit ENTERS the failed state. For the two marshall nodes
+# (Restart=on-failure, RestartSec=5) that is the start limit -- a crash loop the unit is
+# not recovering from -- rather than the single restart it shrugs off; cmesh-logwatch
+# covers those, from systemd's NRestarts counter. cmesh-logwatch's own unit is on the
+# list, so a monitor that cannot run says so instead of going quiet.
+#
+# The drop-in names the unit literally rather than using %n: it stays readable, and it
+# does not depend on specifier expansion inside a dependency directive. The unit
+# existence test reads the fragment paths first, so this also works in build mode where
+# PID 1 is not the systemd that will run it.
+log "unit failure alerts"
+unit_exists() { # unit_exists <unit.service>
+    [ -f "/etc/systemd/system/$1" ] || [ -f "/run/systemd/system/$1" ] || [ -f "/usr/lib/systemd/system/$1" ] \
+        || systemctl cat "$1" >/dev/null 2>&1
+}
+ONFAIL_UNITS=(httpd marshall-model marshall-live certbot-renew cmesh-logwatch)
+for u in "${ONFAIL_UNITS[@]}"; do
+    if ! unit_exists "${u}.service"; then
+        ok "no ${u}.service on this host; nothing to wire"
+        continue
+    fi
+    d="/etc/systemd/system/${u}.service.d"
+    want="[Unit]
+OnFailure=cmesh-alert@${u}.service"
+    install -d -m 0755 "$d"
+    if [ -f "$d/50-cmesh-onfailure.conf" ] && [ "$(cat "$d/50-cmesh-onfailure.conf")" = "$want" ]; then
+        ok "unchanged ${d}/50-cmesh-onfailure.conf"
+    else
+        printf '%s\n' "$want" > "$d/50-cmesh-onfailure.conf"
+        chmod 0644 "$d/50-cmesh-onfailure.conf"
+        ok "installed ${d}/50-cmesh-onfailure.conf"
+    fi
+done
 
 ### Kernel command line: AppArmor LSM, audit on from boot ###############################
 
@@ -335,7 +392,7 @@ for u in "${UNITS[@]}"; do
 done
 if live; then
     for u in nftables.service auditd.service sshguard.service smartd.service mdmonitor.service \
-             cmesh-arch-audit.timer cmesh-integrity.timer systemd-timesyncd.service; do
+             cmesh-arch-audit.timer cmesh-integrity.timer cmesh-logwatch.timer systemd-timesyncd.service; do
         systemctl restart "$u" >/dev/null 2>&1 && ok "started ${u}" || warn "could not start ${u}: $(systemctl status "$u" 2>&1 | grep -m1 -E 'Active:|error' )"
     done
     # apparmor.service needs the LSM on the cmdline, which needs a reboot.
@@ -360,6 +417,8 @@ if live; then
     echo "  * open a SECOND ssh session as ${ADMIN_USER} and confirm sudo works BEFORE closing this one"
     echo "  * restrict SSH sources in /etc/nftables.conf (ssh_allowed_v4), then: nft -c -f /etc/nftables.conf && nft -f /etc/nftables.conf"
     echo "  * journalctl --setup-keys  (store the verification key off the box)"
+    echo "  * take alerts off the box: sudoedit /etc/cmesh-byol/alert.env, then run"
+    echo "    scripts/cmesh-alert-poller from a machine that is NOT this host"
     echo "  * reboot to activate AppArmor and audit=1; then: cmesh-byol-harden --status"
     echo "  * close the boot chain: cmesh-byol-secureboot status, then prepare / enroll / finish (see README)"
 fi

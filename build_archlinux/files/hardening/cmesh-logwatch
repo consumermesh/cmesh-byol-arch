@@ -1,0 +1,279 @@
+#!/bin/bash
+# cmesh-logwatch — turn hard errors in the journal into cmesh-alert alerts.
+#
+# WHY THIS EXISTS
+#
+# cmesh-alert is the funnel; mdadm, smartd, the arch-audit timer and the integrity
+# timer already report to it. Nothing watched the four things whose failure is an
+# outage or a compliance event: httpd, the two marshall nodes, and certbot. A failed
+# `certbot-renew.service` left no trace outside its own journal, and both marshall
+# units run Restart=on-failure, so a crash loop looks exactly like a healthy service
+# in `systemctl is-active` — it is only visible in the journal, in the restart
+# counter, or when the start limit finally trips.
+#
+# Run every 5 minutes by cmesh-logwatch.timer. For each watched unit it reads the
+# journal over the window since its own last scan, counts the entries that matter,
+# and raises at most one alert per unit per run.
+#
+# PHI — READ THIS BEFORE ADDING A CHECK
+#
+# An alert NEVER carries journal text. httpd logs the request URI, and a Phoenix/OTP
+# report embeds tenant slugs, record ids and changeset values, so an alert built by
+# quoting the log can put PHI in the notification path. What leaves this script is a
+# count, a class name, a timestamp and the journalctl command that shows the detail —
+# which the operator reads on the host, over SSH, where it already is. That invariant
+# is the whole reason the delivery stage in cmesh-alert can be a plain object-store
+# PUT instead of something that needs a BAA of its own.
+#
+# TUNING, AND WHAT IT DELIBERATELY MISSES
+#
+# A line is a "hard error" if it matches one of CLASSES below, or if there are more
+# than ERR_MAX err-level lines that match nothing (a burst is a signal even when no
+# pattern names it). Both are adjustable; raising ERR_MAX trades a missed burst for
+# less noise. Ordinary single err-level lines — httpd's AH01797 "client denied by
+# server configuration" is the usual one — are recorded in the journal under
+# `-t cmesh-logwatch` and not alerted on.
+#
+# Certificates are checked for expiry, NOT for whether the renewal job ran. Expiry is
+# the ground truth and is scheduler-agnostic: it catches a broken cron job, a broken
+# timer, an expired ACME account and a ducked rate limit the same way, with CERT_DAYS
+# of runway to fix it.
+#
+# TESTABILITY
+#
+# Every external command is overridable, the way cmesh-integrity's CMESH_INTEGRITY_*
+# variables are, so test/hardening-test.sh can drive this on a scratch tree with a
+# fake journalctl. Leave them unset on a real host:
+#
+#   CMESH_LOGWATCH_STATE        default /var/lib/cmesh-byol/logwatch
+#   CMESH_LOGWATCH_UNITS        default "httpd marshall-model marshall-live"
+#   CMESH_LOGWATCH_ALERT        default /usr/local/sbin/cmesh-alert
+#   CMESH_LOGWATCH_JOURNALCTL   default journalctl
+#   CMESH_LOGWATCH_SYSTEMCTL    default systemctl
+#   CMESH_LOGWATCH_OPENSSL      default openssl
+#   CMESH_LOGWATCH_CERTDIR      default /etc/letsencrypt/live
+#   CMESH_LOGWATCH_ERR_MAX      unclassified err lines that alert (default 20)
+#   CMESH_LOGWATCH_CERT_DAYS    warn this many days before expiry (default 21)
+#   CMESH_LOGWATCH_REPEAT       minutes before the same class re-alerts (default 60)
+#   CMESH_LOGWATCH_CERT_REPEAT  minutes before an expiry re-alerts (default 1440)
+#   CMESH_LOGWATCH_MAX_WINDOW   cap on one scan's window, seconds (default 3600)
+#
+# The first scan of a unit only records the window boundary and alerts nothing: a
+# monitor that beeps the moment it is installed teaches the operator to ignore it.
+set -uo pipefail
+
+STATE="${CMESH_LOGWATCH_STATE:-/var/lib/cmesh-byol/logwatch}"
+UNITS="${CMESH_LOGWATCH_UNITS:-httpd marshall-model marshall-live}"
+ALERT="${CMESH_LOGWATCH_ALERT:-/usr/local/sbin/cmesh-alert}"
+JOURNALCTL="${CMESH_LOGWATCH_JOURNALCTL:-journalctl}"
+SYSTEMCTL="${CMESH_LOGWATCH_SYSTEMCTL:-systemctl}"
+OPENSSL="${CMESH_LOGWATCH_OPENSSL:-openssl}"
+CERTDIR="${CMESH_LOGWATCH_CERTDIR:-/etc/letsencrypt/live}"
+ERR_MAX="${CMESH_LOGWATCH_ERR_MAX:-20}"
+CERT_DAYS="${CMESH_LOGWATCH_CERT_DAYS:-21}"
+REPEAT="${CMESH_LOGWATCH_REPEAT:-60}"
+CERT_REPEAT="${CMESH_LOGWATCH_CERT_REPEAT:-1440}"
+MAX_WINDOW="${CMESH_LOGWATCH_MAX_WINDOW:-3600}"
+
+# A broken monitor is worse than no monitor: if the sink is gone, fail the unit so
+# the failed-unit check (and its own OnFailure drop-in) says so out loud.
+[ -x "$ALERT" ] || { echo "cmesh-logwatch: alert sink ${ALERT} is missing or not executable" >&2; exit 1; }
+mkdir -p "$STATE" || { echo "cmesh-logwatch: cannot create ${STATE}" >&2; exit 1; }
+chmod 0700 "$STATE" 2>/dev/null
+
+NOW=$(date +%s)
+ALERTS=0
+
+# note — the local record. A scan that found something below the alert threshold, or
+# suppressed a repeat, still leaves a line in the journal under this identifier, so
+# the journal answers "was this seen?" without an alert having fired.
+note() { logger -t cmesh-logwatch -- "$*" 2>/dev/null || true; }
+
+# raise <source> <key> <repeat-minutes> <message>
+# One alert per key per window; the key is source-scoped so two units raising the
+# same class do not suppress each other. Never fatal: a failed sink is reported on
+# stderr and on the journal, not by failing this unit.
+raise() {
+    local src="$1" key="$2" window="$3" msg="$4" last
+    last=$(awk -v k="$key" '$1 == k { print $2 }' "$STATE/alerted" 2>/dev/null | tail -1)
+    if [ -n "$last" ] && [ $((NOW - last)) -lt $((window * 60)) ]; then
+        note "suppressed: [${src}] ${msg}"
+        return 0
+    fi
+    if "$ALERT" "$src" "$msg" >/dev/null 2>&1; then
+        { umask 077; printf '%s %s\n' "$key" "$NOW" >> "$STATE/alerted"; } 2>/dev/null
+        # Bounded: the file only ever needs the most recent windows.
+        tail -n 200 "$STATE/alerted" > "$STATE/alerted.tmp" 2>/dev/null \
+            && mv "$STATE/alerted.tmp" "$STATE/alerted"
+        ALERTS=$((ALERTS + 1))
+        echo "ALERT [${src}] ${msg}"
+    else
+        echo "cmesh-logwatch: alert sink ${ALERT} failed for [${src}] ${msg}" >&2
+        note "sink failed: [${src}] ${msg}"
+    fi
+    return 0
+}
+
+# name:regex, matched against the LOWER-CASED line. First match wins, so put the
+# specific ones first. Every one of these is a line whose presence means something is
+# actually wrong, which is why matching any of them alerts regardless of ERR_MAX.
+# Lower-casing both sides is deliberate: httpd writes "Segmentation fault" and
+# "could not bind", Erlang writes "=CRASH REPORT", and a case-sensitive list misses one
+# of them silently -- which is the failure mode this whole script exists to catch.
+CLASSES=(
+    'crash-report:=crash report'
+    'supervisor-report:=supervisor report'
+    'error-report:=error report'
+    'process-exit:\*\* \(exit\)'
+    'process-throw:\*\* \(throw\)'
+    'gen-server-down:genserver .* terminating'
+    'out-of-memory:out of memory|oom-kill|cannot allocate memory'
+    'disk-full:no space left on device'
+    'segfault:segmentation fault|sigsegv|sigbus'
+    'addr-in-use:eaddrinuse|address already in use'
+    'httpd-core:\[core:error\]|premature end of script headers|could not bind to address|reached maxrequestworkers'
+)
+
+scan_unit() {
+    local unit="$1" f="$STATE/$unit.last" last out rc
+    local -A counts=()
+    local line spec name pat matched k summary="" sep="" total=0 hard=0 unclassified=0 lower
+
+    if [ ! -f "$f" ]; then
+        printf '%s\n' "$NOW" > "$f"
+        echo "primed ${unit} (first scan records the window; nothing to alert yet)"
+        return 0
+    fi
+
+    last=$(cat "$f" 2>/dev/null)
+    case "$last" in ''|*[!0-9]*) last=$((NOW - 900)) ;; esac
+    # A host that was down for a week should not replay a week of errors in one go.
+    [ $((NOW - last)) -gt "$MAX_WINDOW" ] && last=$((NOW - MAX_WINDOW))
+
+    out=$("$JOURNALCTL" -u "$unit" -p err --no-pager -o cat --since "@$last" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # Do not advance the window on a failed read, or its errors are lost.
+        note "${unit}: journalctl failed (rc=${rc}); window left open"
+        echo "WARN ${unit}: journalctl failed (rc=${rc}); window left open" >&2
+        return 0
+    fi
+    printf '%s\n' "$NOW" > "$f"
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        total=$((total + 1))
+        matched=""
+        lower="${line,,}"
+        for spec in "${CLASSES[@]}"; do
+            name="${spec%%:*}"; pat="${spec#*:}"
+            # bash's own ERE match, not `grep`: this loop runs once per class per
+            # line, and a 1000-line window would otherwise be 11000 processes.
+            if [[ "$lower" =~ $pat ]]; then matched="$name"; break; fi
+        done
+        if [ -n "$matched" ]; then
+            counts["$matched"]=$(( ${counts["$matched"]:-0} + 1 ))
+            hard=$((hard + 1))
+        else
+            counts['unclassified']=$(( ${counts['unclassified']:-0} + 1 ))
+            unclassified=$((unclassified + 1))
+        fi
+    done <<< "$out"
+
+    if [ "${#counts[@]}" -gt 0 ]; then
+        for k in $(printf '%s\n' "${!counts[@]}" | sort); do
+            summary+="${sep}${k}=${counts[$k]}"; sep=", "
+        done
+    fi
+
+    # The window is reported in the alert so the operator's journalctl shows exactly
+    # what this scan saw, and nothing was quoted to build it.
+    local since_h; since_h=$(date -Is -d "@$last")
+
+    if [ "$hard" -eq 0 ] && [ "$unclassified" -lt "$ERR_MAX" ]; then
+        if [ "$total" -gt 0 ]; then
+            note "${unit}: ${total} err-level line(s) since ${since_h}, none hard (${summary})"
+            echo "${unit}: ${total} err-level line(s), none hard"
+        fi
+        return 0
+    fi
+
+    raise "$unit" "journal:$unit" "$REPEAT" \
+        "hard errors in ${unit} since ${since_h}: ${summary} (${total} err-level line(s); unclassified alerts at ${ERR_MAX}); detail: journalctl -u ${unit} --since '${since_h}' -p err"
+}
+
+# systemd has given up on these. OnFailure= raises them the moment it happens; this is
+# the backstop for a unit that failed before the drop-in existed, and the only source
+# of "no longer failed" evidence. Only newly-failed units alert, so a unit that stays
+# down does not nag every five minutes.
+scan_failed() {
+    local failed prev new u
+    # The unit name is NOT field 1: systemd prefixes the line with a bullet (●, or * when
+    # it is not writing to a tty -- which is how this always runs), and --plain does not
+    # remove it. Take the first field that looks like a unit name instead.
+    failed=$("$SYSTEMCTL" --failed --no-pager --no-legend --plain 2>/dev/null \
+        | awk '{for (i = 1; i <= NF; i++) if ($i ~ /\.(service|timer|socket|mount|swap|path|target)$/) { print $i; break }}' \
+        | sort -u)
+    prev="$STATE/failed"
+    if [ -s "$prev" ]; then
+        new=$(comm -13 "$prev" <(printf '%s\n' "$failed") 2>/dev/null)
+    else
+        new="$failed"
+    fi
+    if [ -n "$failed" ]; then
+        printf '%s\n' "$failed" > "$prev"
+    else
+        : > "$prev"
+    fi
+
+    for u in $new; do
+        [ -n "$u" ] || continue
+        raise "systemd" "failed:$u" "$REPEAT" \
+            "${u} is in the failed state; detail: systemctl status ${u} && journalctl -u ${u} -n 80"
+    done
+}
+
+# The only visible trace of a service that crashes, restarts, and looks healthy:
+# systemd resets the unit state, so NRestarts (not is-active) is what moves.
+scan_restarts() {
+    local unit r rf prev
+    for unit in $UNITS; do
+        r=$("$SYSTEMCTL" show -p NRestarts --value "$unit" 2>/dev/null)
+        case "$r" in ''|*[!0-9]*) r=0 ;; esac
+        rf="$STATE/$unit.restarts"
+        prev=$(cat "$rf" 2>/dev/null)
+        case "$prev" in ''|*[!0-9]*) prev=$r ;; esac
+        printf '%s\n' "$r" > "$rf"
+        if [ "$r" -gt "$prev" ]; then
+            raise "$unit" "restarts:$unit" "$REPEAT" \
+                "${unit} auto-restarted $((r - prev)) time(s) since the last check (${r} total) -- a crash the unit recovered from, which is-active cannot show; detail: journalctl -u ${unit} -p warning -n 80"
+        fi
+    done
+}
+
+# Expiry, not "did the job run" — see the header. An unreadable certificate is its own
+# alert rather than a guessed expiry: openssl failing is not evidence a cert is old.
+scan_certs() {
+    local f name end
+    for f in "$CERTDIR"/*/fullchain.pem; do
+        [ -f "$f" ] || continue
+        name=$(basename "$(dirname "$f")")
+        if ! end=$("$OPENSSL" x509 -enddate -noout -in "$f" 2>/dev/null); then
+            raise "certbot" "cert-unreadable:$name" "$CERT_REPEAT" \
+                "cannot read the TLS certificate at ${f} (is cmesh-logwatch running as root?); renewal state is unknown"
+            continue
+        fi
+        "$OPENSSL" x509 -checkend $((CERT_DAYS * 86400)) -noout -in "$f" >/dev/null 2>&1 && continue
+        raise "certbot" "cert:$name" "$CERT_REPEAT" \
+            "TLS certificate '${name}' expires within ${CERT_DAYS} days (${end#*=}); renewal is not keeping up; detail: systemctl status certbot-renew.timer && certbot certificates"
+    done
+}
+
+for unit in $UNITS; do scan_unit "$unit"; done
+scan_failed
+scan_restarts
+scan_certs
+
+{ umask 077; printf '%s %s\n' "$(date -Is)" "$ALERTS"; } > "$STATE/last-run" 2>/dev/null
+echo "cmesh-logwatch: scanned ${UNITS// /, }; ${ALERTS} alert(s)"
+exit 0

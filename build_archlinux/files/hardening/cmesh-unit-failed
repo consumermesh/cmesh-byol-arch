@@ -1,0 +1,44 @@
+#!/bin/bash
+# cmesh-unit-failed — the OnFailure= handler: report a unit systemd has given up on.
+#
+# Installed as cmesh-alert@.service and reached from a per-unit drop-in that
+# cmesh-byol-harden writes:
+#
+#     /etc/systemd/system/<unit>.service.d/50-cmesh-onfailure.conf
+#     [Unit]
+#     OnFailure=cmesh-alert@<unit>.service
+#
+# OnFailure fires only when a unit ENTERS the failed state. For the two marshall
+# nodes (Restart=on-failure, RestartSec=5) that means the start limit was hit -- a
+# crash loop the unit is not recovering from -- rather than the single restart it
+# shrugs off. The restarts that never get that far are cmesh-logwatch's job, which
+# reads systemd's NRestarts counter instead.
+#
+# The message is a unit name, a systemd Result, an exit code and a restart count.
+# No journal text, for the reason spelled out in cmesh-logwatch's header.
+set -uo pipefail
+
+ALERT="${CMESH_ALERT_BIN:-/usr/local/sbin/cmesh-alert}"
+SYSTEMCTL="${CMESH_UNIT_FAILED_SYSTEMCTL:-systemctl}"
+
+unit="${1:-}"
+if [ -z "$unit" ]; then
+    echo "usage: cmesh-unit-failed <unit>" >&2
+    exit 64
+fi
+# The template instance arrives as a bare name (cmesh-alert@marshall-live.service
+# gives %i = "marshall-live"); accept either spelling so the same script is usable
+# by hand and from a drop-in that named the full unit.
+case "$unit" in
+    *.service|*.timer|*.socket|*.mount|*.swap|*.path) ;;
+    *) unit="${unit}.service" ;;
+esac
+src="${unit%.service}"
+
+result=$("$SYSTEMCTL" show -p Result --value "$unit" 2>/dev/null)
+status=$("$SYSTEMCTL" show -p ExecMainStatus --value "$unit" 2>/dev/null)
+restarts=$("$SYSTEMCTL" show -p NRestarts --value "$unit" 2>/dev/null)
+
+"$ALERT" "$src" \
+    "${unit} FAILED (result=${result:-?} exit=${status:-?} restarts=${restarts:-?}); detail: systemctl status ${unit} && journalctl -u ${unit} -n 80"
+exit 0

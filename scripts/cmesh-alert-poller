@@ -1,0 +1,130 @@
+#!/bin/bash
+# cmesh-alert-poller — read the alert dead-drop, decrypt it, and hand it onwards.
+#
+# RUN THIS ON A MACHINE THAT IS NOT THE PHI HOST.
+#
+# The host writes one age-encrypted JSON object per alert to the Linode bucket it
+# already backs up to (cmesh-alert's delivery stage). This reads that prefix back,
+# decrypts with the age identity that never leaves your side, and prints -- so the
+# hop to ntfy, mail, a phone or a pager starts OUTSIDE the PHI boundary. That is the
+# whole point of the split: the server's egress is a PUT to storage it already trusts,
+# and the public-service curl happens here.
+#
+# The payload is already reduced to {"ts","host","source","message"} where the message
+# is a summary (unit, count, class, timestamp) -- no journal text, because on the host
+# a journal line can carry PHI. Read the detail over SSH.
+#
+# Configuration (environment, or --env FILE):
+#   CMESH_ALERT_S3_ENDPOINT   us-east-1.linodeobjects.com          REQUIRED
+#   CMESH_ALERT_S3_BUCKET     cmeshai-backups                      REQUIRED
+#   CMESH_ALERT_S3_PREFIX     alerts
+#   CMESH_ALERT_AGE_IDENTITY  ~/.age/marshall-alert-identity.txt   REQUIRED
+#   CMESH_ALERT_STATE         ~/.cache/cmesh-alert
+#   CMESH_ALERT_NTFY_TOPIC    set it to forward, or pass --ntfy TOPIC
+#   CMESH_ALERT_NTFY_HOST     ntfy.sh (use your own if you self-host)
+#   CMESH_ALERT_AWS / CMESH_ALERT_AGE / CMESH_ALERT_CURL
+#
+# Usage:
+#   scripts/cmesh-alert-poller                 # print what is new, mark it read
+#   scripts/cmesh-alert-poller --all           # print everything, ignore the seen list
+#   scripts/cmesh-alert-poller --ntfy TOPIC    # print and push
+#   scripts/cmesh-alert-poller --dry-run       # list what would be read, change nothing
+#
+# Run it on a timer -- a systemd --user timer or a cron entry -- so a notification
+# arrives without you asking. Anything it cannot decrypt is left unread and the exit
+# status is non-zero, so the failure is visible rather than a silently skipped alert.
+set -uo pipefail
+
+ENDPOINT="${CMESH_ALERT_S3_ENDPOINT:-}"
+BUCKET="${CMESH_ALERT_S3_BUCKET:-}"
+PREFIX="${CMESH_ALERT_S3_PREFIX:-alerts}"
+IDENTITY="${CMESH_ALERT_AGE_IDENTITY:-$HOME/.age/marshall-alert-identity.txt}"
+STATE="${CMESH_ALERT_STATE:-${XDG_CACHE_HOME:-$HOME/.cache}/cmesh-alert}"
+AWS="${CMESH_ALERT_AWS:-aws}"
+AGE="${CMESH_ALERT_AGE:-age}"
+CURL="${CMESH_ALERT_CURL:-curl}"
+NTFY_TOPIC="${CMESH_ALERT_NTFY_TOPIC:-}"
+NTFY_HOST="${CMESH_ALERT_NTFY_HOST:-ntfy.sh}"
+
+ALL=0; DRY=0; LIMIT=50
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --all)      ALL=1 ;;
+        --dry-run)  DRY=1 ;;
+        --limit)    LIMIT="${2:?--limit needs a number}"; shift ;;
+        --ntfy)     NTFY_TOPIC="${2:?--ntfy needs a topic}"; shift ;;
+        --env)      # shellcheck source=/dev/null
+                    [ -r "${2:?--env needs a file}" ] || { echo "no such env file: $2" >&2; exit 66; }
+                    . "$2"; shift ;;
+        -h|--help)  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)          echo "unknown argument: $1" >&2; exit 64 ;;
+    esac
+    shift
+done
+
+die() { echo "cmesh-alert-poller: $*" >&2; exit 1; }
+
+[ -n "$ENDPOINT" ] || die "CMESH_ALERT_S3_ENDPOINT is not set"
+[ -n "$BUCKET" ]   || die "CMESH_ALERT_S3_BUCKET is not set"
+[ -r "$IDENTITY" ] || die "age identity is not readable: ${IDENTITY} (this file must NOT live on the PHI host)"
+command -v "$AWS" >/dev/null 2>&1 || die "${AWS} not found (need the AWS CLI, same as the backups use)"
+command -v "$AGE" >/dev/null 2>&1 || die "${AGE} not found (pacman -S age)"
+mkdir -p "$STATE" || die "cannot create ${STATE}"
+chmod 0700 "$STATE" 2>/dev/null
+SEEN="$STATE/seen"
+touch "$SEEN" 2>/dev/null || die "cannot write ${SEEN}"
+
+# aws s3 ls --recursive prints "<date> <time> <size> <key>"; $4 is the key. Listed
+# once: a second listing part-way through the loop could disagree with the first.
+if ! listing=$("$AWS" s3 ls "s3://${BUCKET}/${PREFIX}/" --recursive \
+        --endpoint-url "https://${ENDPOINT}" 2>&1); then
+    die "listing s3://${BUCKET}/${PREFIX}/ failed: ${listing}"
+fi
+keys=$(printf '%s\n' "$listing" | awk 'NF {print $4}' | sort)
+
+new=0; failed=0; read_count=0
+while read -r key; do
+    [ -n "$key" ] || continue
+    case "$key" in *.age) ;; *) continue ;; esac
+    if [ "$ALL" -eq 0 ] && grep -qxF "$key" "$SEEN"; then continue; fi
+    if [ "$read_count" -ge "$LIMIT" ]; then
+        echo "cmesh-alert-poller: --limit ${LIMIT} reached; more remain for the next run" >&2
+        break
+    fi
+
+    if [ "$DRY" -eq 1 ]; then
+        echo "would read s3://${BUCKET}/${key}"
+        read_count=$((read_count + 1)); new=$((new + 1))
+        continue
+    fi
+
+    line=$("$AWS" s3 cp "s3://${BUCKET}/${key}" - --quiet \
+            --endpoint-url "https://${ENDPOINT}" 2>/dev/null | "$AGE" -d -i "$IDENTITY" 2>/dev/null)
+    if [ -z "$line" ]; then
+        # Left unread on purpose: a decrypt failure is usually a wrong identity, and
+        # marking it read would throw the alert away.
+        echo "cmesh-alert-poller: could not read or decrypt ${key}" >&2
+        failed=$((failed + 1)); read_count=$((read_count + 1))
+        continue
+    fi
+
+    printf '%s\n' "$line"
+    printf '%s\n' "$key" >> "$SEEN"
+    new=$((new + 1)); read_count=$((read_count + 1))
+
+    if [ -n "$NTFY_TOPIC" ]; then
+        if "$CURL" -fsS -H "Title: cmesh alert" -d "$line" \
+            "https://${NTFY_HOST}/${NTFY_TOPIC}" -o /dev/null; then
+            :
+        else
+            echo "cmesh-alert-poller: ntfy push failed for ${key} (the alert was still printed)" >&2
+            failed=$((failed + 1))
+        fi
+    fi
+done <<< "$keys"
+
+if [ "$new" -eq 0 ]; then
+    echo "cmesh-alert-poller: no new alerts under s3://${BUCKET}/${PREFIX}/"
+fi
+[ "$failed" -eq 0 ] || die "${failed} alert(s) could not be read or forwarded"
+exit 0

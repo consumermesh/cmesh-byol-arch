@@ -3,12 +3,15 @@
 #
 # Usage: cmesh-alert <source> <message...>      (also reads the message from stdin)
 #
-# mdadm (PROGRAM in mdadm.conf), smartd (-M exec), the arch-audit timer, and the
-# integrity timer all call this. It writes the alert to the journal at priority err with
-# SYSLOG_IDENTIFIER=cmesh-alert, and appends it to /var/log/cmesh-alerts.log.
+# mdadm (PROGRAM in mdadm.conf), smartd (-M exec), the arch-audit timer, the integrity
+# timer, cmesh-logwatch and cmesh-unit-failed all call this. It writes the alert to the
+# journal at priority err with SYSLOG_IDENTIFIER=cmesh-alert, and appends it to
+# /var/log/cmesh-alerts.log.
 #
-# To get alerts OFF the box, add a delivery here (webhook, mail, pager) or alert on the
-# identifier from your log collector: `journalctl -t cmesh-alert -p err`.
+# Off-box delivery is opt-in and lives at the bottom of this file: configure
+# /etc/cmesh-byol/alert.env (template: cmesh-alert.env.example) once and every caller
+# gets it for free. Until then the alert is on the box only -- and alerting on the
+# identifier from a collector still works: `journalctl -t cmesh-alert -p err`.
 set -u
 LOG="${CMESH_ALERT_LOG:-/var/log/cmesh-alerts.log}"
 
@@ -37,4 +40,103 @@ stamp=$(date -Is)
 line="${stamp} [${src}] ${msg}"
 logger -p daemon.err -t cmesh-alert -- "[${src}] ${msg}"
 { umask 077; printf '%s\n' "$line" >> "$LOG"; } 2>/dev/null
+
+### Delivery: getting alerts off the box ################################################
+#
+# Opt-in, and the ONE place this host sends anything anywhere. It ships the message it
+# was handed -- and nothing else. That message is already a summary (unit, count,
+# class, timestamp), because every caller is written that way; see cmesh-logwatch's
+# header for why that rule is load-bearing rather than stylistic. What makes this
+# defensible on a PHI host is not the transport but the payload: no journal text ever
+# reaches this function, so no journal text can reach the bucket.
+#
+# The object is age-encrypted to CMESH_ALERT_AGE_RECIPIENTS, so the storage provider
+# cannot read it either, and it lands in the bucket that already holds the encrypted
+# backups -- no new vendor, key or open port.
+#
+#   /etc/cmesh-byol/alert.env (root-owned 0600; template cmesh-alert.env.example)
+#     CMESH_ALERT_DELIVERY=s3                 # off (the default) | s3
+#     CMESH_ALERT_S3_ENDPOINT=us-east-1.linodeobjects.com
+#     CMESH_ALERT_S3_BUCKET=cmeshai-backups
+#     CMESH_ALERT_S3_PREFIX=alerts
+#     CMESH_ALERT_AGE_RECIPIENTS=/etc/cmesh-byol/alert-recipients.txt
+#
+# The config governs delivery ONLY, and wins over the environment for those settings
+# (the way systemd's EnvironmentFile= wins over Environment=) -- so point
+# CMESH_ALERT_CONFIG somewhere else to override it in a test or a one-off.
+#
+# scripts/cmesh-alert-poller reads the prefix back on a machine that is NOT the PHI
+# host, decrypts with the matching age identity and can forward from there, so a push
+# notification originates outside the PHI boundary.
+deliver() { # deliver <source> <message>
+    local config="${CMESH_ALERT_CONFIG:-/etc/cmesh-byol/alert.env}"
+    # shellcheck source=/dev/null
+    [ -r "$config" ] && . "$config"
+    [ "${CMESH_ALERT_DELIVERY:-off}" = "s3" ] || return 0
+
+    local key val missing="" host ts objsrc one jsrc json tmp enc
+    for key in CMESH_ALERT_S3_ENDPOINT CMESH_ALERT_S3_BUCKET CMESH_ALERT_AGE_RECIPIENTS; do
+        val="${!key:-}"
+        [ -n "$val" ] || missing="${missing} ${key}"
+    done
+    if [ -n "$missing" ]; then
+        logger -p daemon.err -t cmesh-alert -- "delivery=s3 but${missing} is unset; alert stayed local"
+        echo "cmesh-alert: delivery=s3 but${missing} is unset; alert stayed local" >&2
+        return 0
+    fi
+
+    host=$(uname -n)
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    objsrc=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-')
+    # $$ keeps two alerts in the same second from overwriting each other.
+    local obj="${CMESH_ALERT_S3_PREFIX:-alerts}/${host}/${ts}-$$-${objsrc}.json.age"
+
+    # A JSON document assembled with printf has to survive a quote or a newline in a
+    # unit name or a provider message, so collapse the whitespace and escape.
+    one=$(printf '%s' "$2" | tr '\n\r\t' '   ' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    jsrc=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    json=$(printf '{"ts":"%s","host":"%s","source":"%s","message":"%s"}\n' \
+        "$(date -Is)" "$host" "$jsrc" "$one")
+
+    tmp=$(umask 077; mktemp) || { logger -p daemon.err -t cmesh-alert -- "mktemp failed; alert stayed local"; return 0; }
+    enc="${tmp}.age"
+    printf '%s' "$json" > "$tmp"
+
+    if ! "${CMESH_ALERT_AGE:-age}" -R "$CMESH_ALERT_AGE_RECIPIENTS" -o "$enc" "$tmp" 2>>"$LOG"; then
+        logger -p daemon.err -t cmesh-alert -- "age encryption failed; alert stayed local (see ${LOG})"
+        rm -f "$tmp" "$enc"; return 0
+    fi
+
+    # Credentials: whatever the environment already carries, or the AWS_* assignments
+    # in a file this host already keeps for the same bucket (the backup unit's
+    # EnvironmentFile, /etc/marshall/backup.env). Extracted with sed rather than
+    # sourced: an alert path should not execute a config file as root, and this way
+    # nothing but AWS_* can escape it.
+    local creds_line=""
+    if [ -n "${CMESH_ALERT_CREDENTIALS_FILE:-}" ]; then
+        if [ ! -r "$CMESH_ALERT_CREDENTIALS_FILE" ]; then
+            logger -p daemon.err -t cmesh-alert -- "credentials file ${CMESH_ALERT_CREDENTIALS_FILE} is unreadable; alert stayed local"
+            echo "cmesh-alert: ${CMESH_ALERT_CREDENTIALS_FILE} is unreadable; alert stayed local" >&2
+            rm -f "$tmp" "$enc"; return 0
+        fi
+        creds_line=$(sed -nE \
+            's/^[[:space:]]*(export[[:space:]]+)?(AWS_[A-Z_]+)=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\2=\3/p' \
+            "$CMESH_ALERT_CREDENTIALS_FILE" 2>/dev/null)
+    fi
+
+    # shellcheck disable=SC2086  # $creds_line is nothing but KEY=VALUE assignments by construction
+    if env $creds_line timeout "${CMESH_ALERT_TIMEOUT:-30}" "${CMESH_ALERT_AWS:-aws}" s3 \
+        --endpoint-url "https://${CMESH_ALERT_S3_ENDPOINT}" \
+        cp "$enc" "s3://${CMESH_ALERT_S3_BUCKET}/${obj}" >>"$LOG" 2>&1; then
+        logger -t cmesh-alert -- "alert delivered to s3://${CMESH_ALERT_S3_BUCKET}/${obj}"
+    else
+        logger -p daemon.err -t cmesh-alert -- "s3 delivery failed; the alert is still in the journal and ${LOG}"
+        echo "cmesh-alert: s3 delivery failed for ${obj}" >&2
+    fi
+    rm -f "$tmp" "$enc"
+    return 0
+}
+
+# Never fails the caller: an alert that could not be delivered is still on the box.
+deliver "$src" "$msg"
 exit 0
