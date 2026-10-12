@@ -415,7 +415,8 @@ if live; then
     echo
     echo "Next:"
     echo "  * open a SECOND ssh session as ${ADMIN_USER} and confirm sudo works BEFORE closing this one"
-    echo "  * restrict SSH sources in /etc/nftables.conf (ssh_allowed_v4), then: nft -c -f /etc/nftables.conf && nft -f /etc/nftables.conf"
+    echo "  * /etc/nftables.conf was just replaced and reloaded: re-apply your own rules"
+    echo "    (ssh_allowed_v4, any service ports), then: nft -c -f /etc/nftables.conf && nft -f /etc/nftables.conf"
     echo "  * journalctl --setup-keys  (store the verification key off the box)"
     echo "  * take alerts off the box: sudoedit /etc/cmesh-byol/alert.env, then run"
     echo "    scripts/cmesh-alert-poller from a machine that is NOT this host"
