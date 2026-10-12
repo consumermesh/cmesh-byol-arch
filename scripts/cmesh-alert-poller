@@ -24,6 +24,13 @@
 #   CMESH_ALERT_NTFY_HOST     ntfy.sh (use your own if you self-host)
 #   CMESH_ALERT_AWS / CMESH_ALERT_AGE / CMESH_ALERT_CURL
 #
+# CREDENTIALS are not a CMESH_ALERT_ setting: this shells out to the AWS CLI, so it
+# uses the standard chain -- AWS_PROFILE against ~/.aws/credentials, or
+# AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY in the environment. A file given to --env is
+# exported (see below), so any of those can live in it, which is also why the file must
+# be owner-only. Use a READ-ONLY key scoped to this one bucket, never the account-wide
+# key the backups write with: this machine only ever needs to read.
+#
 # Usage:
 #   scripts/cmesh-alert-poller                 # print what is new, mark it read
 #   scripts/cmesh-alert-poller --all           # print everything, ignore the seen list
@@ -31,8 +38,9 @@
 #   scripts/cmesh-alert-poller --dry-run       # list what would be read, change nothing
 #   scripts/cmesh-alert-poller --env ~/.config/cmesh-alert/poller.env
 #
-# --env FILE is read before the defaults are resolved, so it can set any of them;
-# --ntfy on the command line overrides the file.
+# --env FILE is read before the defaults are resolved, so it can set any of them, and it
+# is sourced with `set -a`: everything in it is exported, so AWS_PROFILE and the like
+# reach the AWS CLI. --ntfy on the command line overrides the file.
 #
 # Run it on a timer -- a systemd --user timer or a cron entry -- so a notification
 # arrives without you asking. Anything it cannot decrypt is left unread and the exit
@@ -59,8 +67,14 @@ while [ $# -gt 0 ]; do
 done
 if [ -n "$ENV_FILE" ]; then
     [ -r "$ENV_FILE" ] || { echo "no such env file: ${ENV_FILE}" >&2; exit 66; }
+    # set -a, so the file can carry the AWS CLI's own settings (AWS_PROFILE,
+    # AWS_ACCESS_KEY_ID, AWS_DEFAULT_REGION). Plain sourcing left them as shell
+    # variables the aws child never saw, and the run died on "Unable to locate
+    # credentials" with the credentials sitting right there in the file.
+    set -a
     # shellcheck source=/dev/null
     . "$ENV_FILE"
+    set +a
 fi
 
 ENDPOINT="${CMESH_ALERT_S3_ENDPOINT:-}"
