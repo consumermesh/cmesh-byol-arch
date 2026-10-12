@@ -442,7 +442,82 @@ What it puts in place:
 | Hardware | `mdmonitor` (with `--syslog`) and `smartd` (daily short, weekly long self-test) report through `cmesh-alert`. |
 | Vulnerabilities | `cmesh-arch-audit.timer` checks installed packages against the Arch security tracker daily; packages with an available fix raise an alert. Arch has no security-only channel: **schedule `pacman -Syu` and a reboot window.** |
 | File integrity | `cmesh-integrity`: daily `pacman -Qkk` plus a sha256 manifest of `/etc`, `/boot`, `/usr/local`, unit files and SSH keys, against a baseline taken after finalize. A pacman hook re-baselines after each transaction so upgrades do not alert. |
-| Alerts | Everything above calls `/usr/local/sbin/cmesh-alert`, which writes to the journal (`-t cmesh-alert`, priority err) and `/var/log/cmesh-alerts.log`. Add your delivery there, or alert on the identifier from your collector. |
+| Service errors | `cmesh-logwatch` (every 5 minutes) reports hard errors in `httpd` and the two marshall nodes, a crash systemd restarted, any unit in the failed state, and certificate expiry. `OnFailure=` drop-ins report a unit failure the moment it happens — `cmesh-logwatch` included, so a monitor that cannot run says so instead of going quiet. |
+| Alerts | Everything above calls `/usr/local/sbin/cmesh-alert`: the journal (`-t cmesh-alert`, priority err) plus `/var/log/cmesh-alerts.log`, and optional age-encrypted object-storage delivery — see **Alerts off the box** below. |
+
+### Alerts off the box
+
+`cmesh-logwatch.timer` and the `OnFailure=` drop-ins cover the failures an outage or a
+compliance event is made of, and everything lands in one place: `/usr/local/sbin/cmesh-alert`.
+
+- **The marshall nodes and httpd** — a unit entering the failed state, a crash that
+  systemd restarted (its `NRestarts` counter, which `systemctl is-active` cannot show),
+  and err-level journal lines that match a known hard error or arrive in a burst.
+- **Certificate expiry** — every `/etc/letsencrypt/live/*/fullchain.pem` inside 21 days,
+  checked independently of whether the renewal job ran. Expiry is the ground truth, and
+  it catches a broken cron job, a broken timer and a ducked rate limit the same way.
+
+**An alert never carries journal text.** httpd logs the request URI, and a Phoenix/OTP
+report embeds tenant slugs, record ids and changeset values. An alert is a count, a class
+name and the `journalctl` command that shows the detail — which you read on the host.
+That invariant is what lets the delivery below be a plain object-store PUT.
+
+Delivery is **off** until you configure it. The recommended channel is a dead-drop in the
+bucket the encrypted backups already use, age-encrypted so the provider holds ciphertext:
+
+```bash
+sudo cp /etc/cmesh-byol/alert.env.example /etc/cmesh-byol/alert.env
+sudoedit /etc/cmesh-byol/alert.env          # DELIVERY=s3, endpoint, bucket, age recipients
+sudo chmod 0600 /etc/cmesh-byol/alert.env
+sudo /usr/local/sbin/cmesh-alert test "delivery check"
+sudo journalctl -t cmesh-alert -n 5
+```
+
+`scripts/cmesh-alert-poller` then reads that prefix from a machine that is **not** the PHI
+host, decrypts with the age identity that never touches the server, and can forward to
+ntfy, mail or a pager from there — so the public-service hop originates outside the PHI
+boundary. Run it from a `systemd --user` timer or a cron entry on your workstation.
+
+#### Wiring it up, end to end
+
+Once, on your workstation — the keypair must not be generated on the server:
+
+```bash
+pacman -S age aws-cli
+mkdir -p ~/.age && age-keygen -o ~/.age/marshall-alert-identity.txt && chmod 600 ~/.age/marshall-alert-identity.txt
+grep '^# public key:' ~/.age/marshall-alert-identity.txt | cut -d' ' -f4     # the recipient
+```
+
+On the server — `LINODE_S3_ENDPOINT`/`LINODE_S3_BUCKET` are the backup ones; the same
+credentials file is reused, and only its `AWS_*` lines are read:
+
+```bash
+sudo install -d -m 0755 /etc/cmesh-byol
+echo 'age1…' | sudo tee /etc/cmesh-byol/alert-recipients.txt
+sudoedit /etc/cmesh-byol/alert.env      # template: /etc/cmesh-byol/alert.env.example
+```
+
+```ini
+CMESH_ALERT_DELIVERY=s3
+CMESH_ALERT_S3_ENDPOINT=us-east-1.linodeobjects.com
+CMESH_ALERT_S3_BUCKET=cmeshai-backups
+CMESH_ALERT_S3_PREFIX=alerts
+CMESH_ALERT_AGE_RECIPIENTS=/etc/cmesh-byol/alert-recipients.txt
+CMESH_ALERT_CREDENTIALS_FILE=/etc/marshall/backup.env
+```
+
+```bash
+sudo /usr/local/sbin/cmesh-alert test "delivery check"     # journal + log + one object
+sudo systemctl enable --now cmesh-logwatch.timer certbot-renew.timer
+sudo systemctl start cmesh-logwatch.service                # prime now, not in 5 minutes
+sudo /usr/local/sbin/cmesh-byol-harden --status            # delivery + last scan
+```
+
+On the workstation, `~/.config/cmesh-alert/poller.env` (mode `0600`) holds the same
+endpoint and bucket, the identity path, and a long random ntfy topic; then a `--user`
+timer runs `cmesh-alert-poller --env … --ntfy TOPIC` every five minutes. Subscribe to that
+topic in the ntfy app, and `loginctl enable-linger $USER` so it runs when you are logged
+out. The topic is the only secret: treat it as a password, or self-host ntfy.
 
 ### On a server that is already installed
 
@@ -474,8 +549,9 @@ every control without changing anything.
 - **Logs off the box.** Local retention is bounded by the 8 GiB root. Ship the journal
   (`systemd-journal-upload`, or any collector) to storage you control, with the
   retention your policy names. The audit log is the record an auditor asks for.
-- **SSH source addresses**, the PHI paths in `60-cmesh-phi.rules`, and alert delivery in
-  `cmesh-alert` are placeholders until you fill them in.
+- **SSH source addresses** and the PHI paths in `60-cmesh-phi.rules` are placeholders until
+  you fill them in. Alert **delivery** is implemented but off by default: set
+  `/etc/cmesh-byol/alert.env` (see "Alerts off the box") or the alerts never leave the box.
 - **Backups**, a Business Associate Agreement with the provider, the risk analysis, and
   access reviews — paperwork, not packages.
 
