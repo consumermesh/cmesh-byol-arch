@@ -522,8 +522,10 @@ cat > "$PL/aws" <<'PAWS'
 # it only if the poller exported them, which is the point of these two lines.
 printf '%s\n' "${AWS_PROFILE:-none}" >> "${PROFILE_LOG:-/dev/null}"
 case "$1$2" in
-    s3ls) printf '%s\n' "${FAKE_LISTING:-}" ;;
-    s3cp) cat "${FAKE_OBJECT:?}" ;;
+    s3ls) [ -n "${FAKE_LS_FAIL:-}" ] && exit 9
+          printf '%s\n' "${FAKE_LISTING:-}" ;;
+    s3cp) [ -n "${FAKE_CP_FAIL:-}" ] && exit 7
+          cat "${FAKE_OBJECT:?}" ;;
 esac
 PAWS
 cat > "$PL/age" <<'PAGE'
@@ -552,9 +554,17 @@ check "--dry-run lists what a real run would read" yes "$(printf '%s' "$out" | g
 out=$("$POLLER" 2>&1)
 check "--dry-run consumed nothing (the next real run still reads it)" yes "$(printf '%s' "$out" | grep -q 'marshall-live: 2 hard errors' && echo yes || echo no)"
 rm -rf "$PL/state"
-FAKE_UNDECRYPTABLE=1 "$POLLER" >/dev/null 2>&1
+out=$(FAKE_UNDECRYPTABLE=1 "$POLLER" 2>&1)
 check "an undecryptable alert fails loudly instead of being skipped" 1 $?
+check "the decrypt failure quotes age's own reason" yes "$(printf '%s' "$out" | grep -q "decrypt FAILED.*age: no identity matched" && echo yes || echo no)"
+check "it tells you how to check the recipient" yes "$(printf '%s' "$out" | grep -q 'age-keygen -y' && echo yes || echo no)"
 check "an undecryptable alert is NOT marked read" "" "$(grep -o '20261009T160000Z-1' "$PL/state/seen" 2>/dev/null)"
+rm -rf "$PL/state"
+out=$(FAKE_CP_FAIL=1 "$POLLER" 2>&1)
+check "a download failure is named as one, with the aws exit status" yes "$(printf '%s' "$out" | grep -q 'download FAILED.*aws exit 7' && echo yes || echo no)"
+rm -rf "$PL/state"
+out=$(FAKE_LS_FAIL=1 "$POLLER" 2>&1)
+check "a listing failure with no output says so rather than reporting nothing" yes "$(printf '%s' "$out" | grep -q 'failed (aws exit 9): <no output>' && echo yes || echo no)"
 CMESH_ALERT_S3_BUCKET="" "$POLLER" >/dev/null 2>&1
 check "a missing bucket is a hard error, not a silent no-op" 1 $?
 
