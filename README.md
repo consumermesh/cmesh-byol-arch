@@ -513,11 +513,35 @@ sudo systemctl start cmesh-logwatch.service                # prime now, not in 5
 sudo /usr/local/sbin/cmesh-byol-harden --status            # delivery + last scan
 ```
 
-On the workstation, `~/.config/cmesh-alert/poller.env` (mode `0600`) holds the same
-endpoint and bucket, the identity path, and a long random ntfy topic; then a `--user`
-timer runs `cmesh-alert-poller --env … --ntfy TOPIC` every five minutes. Subscribe to that
-topic in the ntfy app, and `loginctl enable-linger $USER` so it runs when you are logged
-out. The topic is the only secret: treat it as a password, or self-host ntfy.
+On the workstation the poller needs to *read* the bucket, and the key it uses should be
+able to do nothing else. Linode Object Storage access keys are account-wide by default,
+so create a **limited access key** with `Read Only` on this bucket alone (Cloud Manager →
+Object Storage → Access Keys → *limit access to a specific bucket*), put it in
+`~/.aws/credentials` under a name, and point the poller at that name:
+
+```ini
+# ~/.aws/credentials   (chmod 600)
+[marshall-alerts]
+aws_access_key_id = …
+aws_secret_access_key = …
+```
+
+```ini
+# ~/.config/cmesh-alert/poller.env   (chmod 600)
+AWS_PROFILE=marshall-alerts
+CMESH_ALERT_S3_ENDPOINT=us-east-1.linodeobjects.com
+CMESH_ALERT_S3_BUCKET=cmeshai-backups
+CMESH_ALERT_S3_PREFIX=alerts
+CMESH_ALERT_AGE_IDENTITY=/home/you/.age/marshall-alert-identity.txt
+CMESH_ALERT_NTFY_TOPIC=…
+```
+
+That file is sourced with `set -a`, so `AWS_PROFILE` (or `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` directly) reaches the AWS CLI — the standard AWS chain applies
+either way. Then a `--user` timer runs `cmesh-alert-poller --env …` every five minutes,
+subscribe to the topic in the ntfy app, and `loginctl enable-linger $USER` so it runs when
+you are logged out. The ntfy topic is the only secret in the notification path: treat it
+as a password, or self-host ntfy.
 
 ### On a server that is already installed
 

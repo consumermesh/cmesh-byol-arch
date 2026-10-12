@@ -518,6 +518,9 @@ echo "(18) cmesh-alert-poller: reads the dead-drop, and never loses one it canno
 PL="$WORK/pl"; mkdir -p "$PL"
 cat > "$PL/aws" <<'PAWS'
 #!/bin/bash
+# Record what the AWS CLI's own settings looked like in this child. Credentials reach
+# it only if the poller exported them, which is the point of these two lines.
+printf '%s\n' "${AWS_PROFILE:-none}" >> "${PROFILE_LOG:-/dev/null}"
 case "$1$2" in
     s3ls) printf '%s\n' "${FAKE_LISTING:-}" ;;
     s3cp) cat "${FAKE_OBJECT:?}" ;;
@@ -563,7 +566,7 @@ cat > "$PL/curl" <<'PCURL'
 printf '%s\n' "$*" >> "$CURL_LOG"
 PCURL
 chmod +x "$PL/curl"
-export CURL_LOG="$PL/curl.log"
+export CURL_LOG="$PL/curl.log" PROFILE_LOG="$PL/profile.log"
 cat > "$PL/poller.env" <<PENV
 CMESH_ALERT_S3_ENDPOINT=us-east-1.linodeobjects.com
 CMESH_ALERT_S3_BUCKET=cmeshai-backups
@@ -573,14 +576,16 @@ CMESH_ALERT_AWS=$PL/aws
 CMESH_ALERT_AGE=$PL/age
 CMESH_ALERT_CURL=$PL/curl
 CMESH_ALERT_NTFY_TOPIC=file-topic
+AWS_PROFILE=workstation-readonly
 PENV
-: > "$CURL_LOG"
+: > "$CURL_LOG"; : > "$PROFILE_LOG"
 out=$(env -u CMESH_ALERT_S3_ENDPOINT -u CMESH_ALERT_S3_BUCKET -u CMESH_ALERT_AGE_IDENTITY \
         -u CMESH_ALERT_STATE -u CMESH_ALERT_AWS -u CMESH_ALERT_AGE -u CMESH_ALERT_CURL \
         -u CMESH_ALERT_NTFY_TOPIC \
         "$POLLER" --env "$PL/poller.env" 2>&1)
 check "--env is read before the defaults (it used to be a no-op)" yes "$(printf '%s' "$out" | grep -q 'marshall-live: 2 hard errors' && echo yes || echo no)"
 check "a topic set in the file is used" yes "$(grep -q 'ntfy.sh/file-topic' "$CURL_LOG" && echo yes || echo no)"
+check "AWS settings in the file are EXPORTED to the aws child" yes "$(grep -qx 'workstation-readonly' "$PROFILE_LOG" && echo yes || echo no)"
 rm -rf "$PL/state2"; : > "$CURL_LOG"
 env -u CMESH_ALERT_NTFY_TOPIC "$POLLER" --env "$PL/poller.env" --ntfy cmdline-topic >/dev/null 2>&1
 check "--ntfy on the command line beats the file" yes "$(grep -q 'ntfy.sh/cmdline-topic' "$CURL_LOG" && echo yes || echo no)"
