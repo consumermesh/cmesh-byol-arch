@@ -106,7 +106,10 @@ touch "$SEEN" 2>/dev/null || die "cannot write ${SEEN}"
 # run where an alert happened to be waiting. s3api returns 0 with no keys, so a
 # non-zero status is unambiguously a real error again.
 #
-# --output text prints the literal "None" for an empty result; drop it.
+# --output text renders a LIST as tab-separated values on ONE line, so two objects
+# arrive as "key1<TAB>key2" -- read as a single key, that is a download of a filename
+# with a tab in it, which works with one object in the bucket and fails with two. Split
+# on tabs as well as newlines. It also prints the literal "None" for an empty result.
 # Listed once: a second listing part-way through the loop could disagree with the first.
 listing=$("$AWS" s3api list-objects-v2 --bucket "$BUCKET" --prefix "${PREFIX}/" \
     --query 'Contents[].Key' --output text \
@@ -117,7 +120,7 @@ if [ "$rc" -ne 0 ]; then
     # whole diagnosis -- a bare "failed:" with an empty tail reads like a bug in here.
     die "listing s3://${BUCKET}/${PREFIX}/ failed (aws exit ${rc}): ${listing:-<no output>}"
 fi
-keys=$(printf '%s\n' "$listing" | grep -vx 'None' | awk 'NF' | sort)
+keys=$(printf '%s\n' "$listing" | grep -vx 'None' | tr '\t' '\n' | awk 'NF' | sort)
 
 new=0; failed=0; read_count=0
 while read -r key; do
