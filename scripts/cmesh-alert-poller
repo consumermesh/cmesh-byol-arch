@@ -100,13 +100,24 @@ chmod 0700 "$STATE" 2>/dev/null
 SEEN="$STATE/seen"
 touch "$SEEN" 2>/dev/null || die "cannot write ${SEEN}"
 
-# aws s3 ls --recursive prints "<date> <time> <size> <key>"; $4 is the key. Listed
-# once: a second listing part-way through the loop could disagree with the first.
-if ! listing=$("$AWS" s3 ls "s3://${BUCKET}/${PREFIX}/" --recursive \
-        --endpoint-url "https://${ENDPOINT}" 2>&1); then
-    die "listing s3://${BUCKET}/${PREFIX}/ failed: ${listing}"
+# ListObjectsV2 rather than `s3 ls`, for one reason: `s3 ls` exits 1 when the prefix
+# matches nothing -- which is the NORMAL state of this bucket, "no unread alerts" -- so
+# the poller called a hard failure on every healthy run, and only ever succeeded on a
+# run where an alert happened to be waiting. s3api returns 0 with no keys, so a
+# non-zero status is unambiguously a real error again.
+#
+# --output text prints the literal "None" for an empty result; drop it.
+# Listed once: a second listing part-way through the loop could disagree with the first.
+listing=$("$AWS" s3api list-objects-v2 --bucket "$BUCKET" --prefix "${PREFIX}/" \
+    --query 'Contents[].Key' --output text \
+    --endpoint-url "https://${ENDPOINT}" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+    # The exit status as well as the text: the AWS CLI can fail with nothing on either
+    # stream (a killed helper, a dropped connection), and "<no output>" is then the
+    # whole diagnosis -- a bare "failed:" with an empty tail reads like a bug in here.
+    die "listing s3://${BUCKET}/${PREFIX}/ failed (aws exit ${rc}): ${listing:-<no output>}"
 fi
-keys=$(printf '%s\n' "$listing" | awk 'NF {print $4}' | sort)
+keys=$(printf '%s\n' "$listing" | grep -vx 'None' | awk 'NF' | sort)
 
 new=0; failed=0; read_count=0
 while read -r key; do
@@ -124,12 +135,37 @@ while read -r key; do
         continue
     fi
 
-    line=$("$AWS" s3 cp "s3://${BUCKET}/${key}" - --quiet \
-            --endpoint-url "https://${ENDPOINT}" 2>/dev/null | "$AGE" -d -i "$IDENTITY" 2>/dev/null)
-    if [ -z "$line" ]; then
-        # Left unread on purpose: a decrypt failure is usually a wrong identity, and
+    # Download and decrypt as two steps with two messages. As one pipeline with both
+    # stderr streams discarded, every failure here read "could not read or decrypt" --
+    # which does not say which half broke, and threw away the one line that does
+    # ("no identity matched any of the recipients" is the usual answer).
+    obj_tmp=$(mktemp) || { echo "cmesh-alert-poller: mktemp failed" >&2; failed=$((failed + 1)); continue; }
+    plain_tmp=$(mktemp); err_tmp=$(mktemp)
+
+    "$AWS" s3 cp "s3://${BUCKET}/${key}" - --quiet \
+        --endpoint-url "https://${ENDPOINT}" >"$obj_tmp" 2>"$err_tmp"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "cmesh-alert-poller: download FAILED for ${key} (aws exit ${rc}): $(tr '\n' ' ' < "$err_tmp" | cut -c1-400)" >&2
+        rm -f "$obj_tmp" "$plain_tmp" "$err_tmp"
+        failed=$((failed + 1)); read_count=$((read_count + 1))
+        continue
+    fi
+
+    "$AGE" -d -i "$IDENTITY" <"$obj_tmp" >"$plain_tmp" 2>"$err_tmp"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # Left unread on purpose: this is usually a recipient/identity mismatch, and
         # marking it read would throw the alert away.
-        echo "cmesh-alert-poller: could not read or decrypt ${key}" >&2
+        echo "cmesh-alert-poller: decrypt FAILED for ${key} (age exit ${rc}): $(tr '\n' ' ' < "$err_tmp" | cut -c1-400)" >&2
+        echo "cmesh-alert-poller:   the recipient the server encrypted to must be the public key of ${IDENTITY} -- check with: age-keygen -y ${IDENTITY}" >&2
+        rm -f "$obj_tmp" "$plain_tmp" "$err_tmp"
+        failed=$((failed + 1)); read_count=$((read_count + 1))
+        continue
+    fi
+
+    line=$(cat "$plain_tmp")
+    rm -f "$obj_tmp" "$plain_tmp" "$err_tmp"
+    if [ -z "$line" ]; then
+        echo "cmesh-alert-poller: ${key} decrypted to nothing" >&2
         failed=$((failed + 1)); read_count=$((read_count + 1))
         continue
     fi
