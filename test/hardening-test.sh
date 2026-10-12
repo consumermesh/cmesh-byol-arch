@@ -522,8 +522,11 @@ cat > "$PL/aws" <<'PAWS'
 # it only if the poller exported them, which is the point of these two lines.
 printf '%s\n' "${AWS_PROFILE:-none}" >> "${PROFILE_LOG:-/dev/null}"
 case "$1$2" in
-    s3ls) [ -n "${FAKE_LS_FAIL:-}" ] && exit 9
-          printf '%s\n' "${FAKE_LISTING:-}" ;;
+    # The real `s3 ls` exits 1 when the prefix matches nothing. The poller must not
+    # use it: model the behaviour so a regression to it fails here.
+    s3ls) exit 1 ;;
+    s3api*) [ -n "${FAKE_LS_FAIL:-}" ] && exit 9
+            printf '%s\n' "${FAKE_KEYS:-None}" ;;
     s3cp) [ -n "${FAKE_CP_FAIL:-}" ] && exit 7
           cat "${FAKE_OBJECT:?}" ;;
 esac
@@ -541,7 +544,7 @@ export CMESH_ALERT_S3_ENDPOINT=us-east-1.linodeobjects.com CMESH_ALERT_S3_BUCKET
        CMESH_ALERT_AGE_IDENTITY="$PL/identity" CMESH_ALERT_STATE="$PL/state" \
        CMESH_ALERT_AWS="$PL/aws" CMESH_ALERT_AGE="$PL/age" \
        FAKE_OBJECT="$PL/object" FAKE_PLAIN="$PL/plain" \
-       FAKE_LISTING="2026-10-09 16:00:00 100 alerts/msh-ca-21/20261009T160000Z-1-logwatch.json.age"
+       FAKE_KEYS="alerts/msh-ca-21/20261009T160000Z-1-logwatch.json.age"
 out=$("$POLLER" 2>&1)
 check "a new alert is printed" yes "$(printf '%s' "$out" | grep -q 'marshall-live: 2 hard errors' && echo yes || echo no)"
 out=$("$POLLER" 2>&1)
@@ -565,6 +568,16 @@ check "a download failure is named as one, with the aws exit status" yes "$(prin
 rm -rf "$PL/state"
 out=$(FAKE_LS_FAIL=1 "$POLLER" 2>&1)
 check "a listing failure with no output says so rather than reporting nothing" yes "$(printf '%s' "$out" | grep -q 'failed (aws exit 9): <no output>' && echo yes || echo no)"
+
+# The bug this replaced: "no unread alerts" is the healthy state of this bucket, and
+# `s3 ls` reports it as an error (exit 1, no output), so the poller failed on every run
+# that had nothing to deliver -- a permanently red timer, and no way to tell a real
+# listing failure from an empty bucket. s3api answers 0 with the literal "None".
+rm -rf "$PL/state"
+out=$(FAKE_KEYS= "$POLLER" 2>&1); rc=$?
+check "an empty prefix is a clean run, not a failure" 0 $rc
+check "an empty prefix reports nothing new" yes "$(printf '%s' "$out" | grep -q 'no new alerts' && echo yes || echo no)"
+check "the poller does not call s3 ls (which cannot report an empty prefix)" 0 "$(code "$POLLER" | grep -c 's3 ls')"
 CMESH_ALERT_S3_BUCKET="" "$POLLER" >/dev/null 2>&1
 check "a missing bucket is a hard error, not a silent no-op" 1 $?
 
