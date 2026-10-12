@@ -434,7 +434,7 @@ What it puts in place:
 |---|---|
 | Named admin account, no shared root login | The installer creates `admin` (or `cmesh_admin_user:` from the cloud-config) in `wheel`, gives it the config drive's SSH keys, then writes `PermitRootLogin no` + `AllowUsers admin` — only after the keys are confirmed in place. sudo is NOPASSWD (there are no passwords) and logs every command and its I/O. |
 | SSH hardening | `sshd_config.d/10-cmesh-hardening.conf`: keys only, 3 tries, 10-minute idle logoff, no forwarding, pre-auth banner (`/etc/issue.net`), modern ciphers, VERBOSE logging (key fingerprint per login). |
-| Firewall | nftables, default deny inbound, SSH rate-limited from `ssh_allowed_v4` — **edit it** in `/etc/nftables.conf` to your management addresses. SSH over IPv6 is off by default (commented rules to enable). sshguard bans brute-forcers into its own nft set. |
+| Firewall | nftables, default deny inbound: SSH rate-limited from `ssh_allowed_v4` — **edit it** in `/etc/nftables.conf` to your management addresses — plus 80 and 443 for httpd (the marshall vhosts, and the ACME http-01 challenge that renewals need). SSH over IPv6 is off by default (commented rules to enable); the marshall names are A records, so there is no v6 service rule. sshguard bans brute-forcers into its own nft set. |
 | Audit trail | auditd with `rules.d/50-cmesh-hipaa.rules`: identity files, sudo, every command run as root by a logged-in user (`-k rootcmd`), the boot path, LUKS/mdadm tools, firewall, modules, mounts, time, failed access. `60-cmesh-phi.rules` watches `/srv` and `/home`; point it at where the PHI lives. `99-…` makes the set immutable until reboot. |
 | Logs | journald persistent, compressed, sealed (run `journalctl --setup-keys` once), bounded to 512 MB. auditd 10 × 50 MB, rotates, never suspends. |
 | Kernel | sysctl: kptr/dmesg restriction, no SysRq, no forwarding, rp_filter, no redirects, syncookies. AppArmor on the kernel command line and `apparmor.service` enabled. No core dumps anywhere (coredump.conf + hard ulimit). |
@@ -564,6 +564,13 @@ close the first.
 A copy is kept at `/usr/share/cmesh-byol/hardening`, so later re-runs are just
 `cmesh-byol-harden` after editing a file there. `cmesh-byol-harden --status` reports
 every control without changing anything.
+
+**A re-run replaces `/etc/nftables.conf` with the shipped copy and reloads the ruleset.**
+Anything that exists only on the host — a service port, a narrowed `ssh_allowed_v4` — is
+gone, and the failure is confusing: the box goes dark on 80/443 while sshd keeps
+answering, so it looks like httpd or DNS. Reconcile `/etc/nftables.conf` against the
+repo's copy before re-running, or add the host's ports and management ranges to the repo
+file as well.
 
 ### What the script cannot do for you
 

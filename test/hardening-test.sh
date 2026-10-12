@@ -120,7 +120,13 @@ check "ssh over IPv6 is documented as a commented define" yes "$(has "$N" '^# de
 check "no live rule references the commented v6 define" 0 "$(code "$N" | grep -c 'ssh_allowed_v6')"
 check "ssh is rate limited" yes "$(has "$N" 'tcp dport 22 .*limit rate over')"
 check "icmpv6 allowed (neighbour discovery)" yes "$(has "$N" 'ipv6-icmp accept')"
-check "no other inbound service port" 0 "$(code "$N" | grep -E 'dport' | grep -vc 'dport 22')"
+check "ssh, http and https are the only open service ports" 0 "$(code "$N" | grep -E 'dport' | grep -vcE 'dport (22|80|443)')"
+check "http is open (httpd answers the ACME challenge there)" yes "$(has "$N" 'tcp dport 80 accept comment')"
+check "https is open (the marshall vhosts terminate TLS there)" yes "$(has "$N" 'tcp dport 443 accept comment')"
+check "the service ports sit before the catch-all reject" yes "$(before "$N" 'tcp dport 443 accept' 'pkttype host limit rate')"
+# The rule that would have prevented the outage: this file is replaced wholesale by a
+# re-run of the hardening, so a port opened only on the host disappears.
+check "the file warns that a re-run replaces it" yes "$(has "$N" 'REPLACED WHOLESALE')"
 
 echo
 echo "(6) sysctl"
