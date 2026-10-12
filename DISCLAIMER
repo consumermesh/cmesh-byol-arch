@@ -1,0 +1,56 @@
+No Warranty. No Liability.
+Copyright (c) 2026 Consumer Mesh, LLC
+
+This repository is offered as-is, as a description of one way to build an Arch Linux
+image for OVHcloud bare-metal servers. Read it with the assumptions spelled out below.
+
+NO WARRANTY
+There is no warranty of any kind, whether express, implied, or statutory, including but
+not limited to the implied warranties of merchantability, fitness for a particular
+purpose, title, and noninfringement. No author or contributor warrants that anything
+here is accurate, complete, current, secure, or fit to run on your hardware. No author
+or contributor warrants that it will work at all, or that it will keep working after an
+Arch Linux, OVHcloud, or firmware change. The README's "Status" section is a statement of
+scope, not a promise: the install path has not been proven on hardware.
+
+NO LIABILITY
+To the maximum extent permitted by applicable law, in no event will any author,
+copyright holder, or contributor be liable for any claim, damage, or other liability,
+whether in contract, tort, or otherwise, arising from, out of, or in connection with
+this repository or its use. This covers, without limitation: direct, indirect,
+incidental, special, exemplary, consequential, and punitive damages; lost or corrupted
+data; lost profits or revenue; business interruption; the cost of substitute goods or
+services; and the cost of recovering or reconstructing any system.
+
+WHAT THIS SOFTWARE ACTUALLY DOES
+You are expected to understand this before you run it, because the code will not ask
+twice:
+
+  - It partitions, formats, and encrypts disks. Run against the wrong device, it
+    destroys the existing contents of that device. That is generally not recoverable.
+  - It writes LUKS headers and creates encrypted volumes. Losing a header or a
+    passphrase loses the data behind it, permanently.
+  - It is written to be run over OVHcloud's KVM/IPMI console against a bare-metal
+    server, and it reboots that server as part of the install. A remote machine that
+    fails to come back may require a support ticket, or physical hands, to recover.
+  - It handles credentials, private keys, certificate material, and LUKS key files.
+    You are responsible for the secrecy, permissions, storage, rotation, and
+    destruction of every secret you put in its way.
+  - It requests and renews TLS certificates and touches live web-serving state. A
+    mistake can take an existing site offline or let a certificate lapse.
+  - It can install packages and services, change SSH and firewall configuration, and
+    alter boot and Secure Boot state, including clearing platform keys.
+
+YOU ACCEPT THE RISK
+By using this repository you accept all of the above risk, and you accept that you are
+responsible for the equipment, data, accounts, and money involved. You agree that you
+will test on a scratch machine before you point it at anything you care about, that you
+will keep an out-of-band console open, and that you will keep backups that are not on
+the machine being rebuilt. If you do not accept these terms, do not use this repository.
+
+This disclaimer supplements, and does not replace or narrow, the MIT License in
+[LICENSE](LICENSE). Where the two overlap, the LICENSE governs the grant of rights to
+this repository's code and documentation, and both disclaim warranty and liability.
+Third-party components obtained at build time — Arch Linux packages, OVH's
+bringyourownlinux, and anything else pulled in — remain under their own terms, and this
+disclaimer speaks only to this repository's own contents.

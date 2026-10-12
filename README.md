@@ -7,6 +7,11 @@ under RAID1**.
 Point the OVHcloud console (or the `POST /dedicated/server/{serviceName}/reinstall`
 API) at the released `.qcow2` URL, and the server comes up encrypted.
 
+> **No warranty. No liability.** This is a disk-partitioning, disk-encrypting,
+> boot-chain-modifying installer for remote bare metal. It can destroy data and it can
+> strand a machine you cannot physically reach. Read [DISCLAIMER](DISCLAIMER) before you
+> run it. You use it at your own risk.
+
 ---
 
 ## Why this repo exists
@@ -704,3 +709,40 @@ repositories at build time. Nothing here changes the licensing of those componen
 MIT grant covers this repository's own scripts and documentation. OVH's
 [bringyourownlinux](https://github.com/ovh/bringyourownlinux) is a separate work under
 its own terms.
+
+## No Warranty; No Liability
+
+Everything in this repository is provided **as is**, with no warranty of any kind,
+express, implied, or statutory — including merchantability, fitness for a particular
+purpose, title, and noninfringement. No author or contributor warrants that it is
+accurate, complete, current, secure, or fit to run on your hardware. The install path
+has **not been proven on hardware**.
+
+To the maximum extent permitted by law, no author, copyright holder, or contributor is
+liable for any claim, damage, or other liability — in contract, tort, or otherwise —
+arising from this repository or its use. That includes, without limitation, direct,
+indirect, incidental, special, exemplary, consequential, and punitive damages; lost or
+corrupted data; lost profits; business interruption; substitute goods or services; and
+the cost of recovering any system.
+
+That disclaimer matters here more than in most repositories, because the code acts on
+real hardware and does not ask twice:
+
+| What it does | The exposure |
+| --- | --- |
+| Partitions, formats, and encrypts disks | Run against the wrong device, it destroys that device's contents. Usually unrecoverable. |
+| Writes LUKS headers and encrypted volumes | A lost header or passphrase loses the data behind it, permanently. |
+| Installs over OVHcloud KVM/IPMI, then reboots | A machine that does not come back may need a support ticket, or hands on it, to recover. |
+| Handles credentials, private keys, certs, key files | Secrecy, permissions, storage, rotation, and destruction of your secrets are your job. |
+| Requests and renews TLS certificates | A mistake can take a live site offline or let a certificate lapse. |
+| Changes packages, services, SSH, firewall, boot, Secure Boot | Includes clearing platform keys. |
+
+By using this repository you accept that risk, and you accept responsibility for the
+equipment, data, accounts, and money involved. Test on a scratch machine before you
+point it at anything you care about, keep an out-of-band console open, and keep backups
+that are not on the machine being rebuilt. If you do not accept these terms, do not use
+this repository.
+
+See [DISCLAIMER](DISCLAIMER) for the full text. It supplements the MIT License and does
+not narrow it; third-party components pulled in at build time stay under their own
+terms.
