@@ -527,7 +527,8 @@ case "$1$2" in
     s3ls) exit 1 ;;
     s3api*) [ -n "${FAKE_LS_FAIL:-}" ] && exit 9
             printf '%s\n' "${FAKE_KEYS:-None}" ;;
-    s3cp) [ -n "${FAKE_CP_FAIL:-}" ] && exit 7
+    s3cp) case "$3" in *$'\t'*) echo "Invalid argument: key contains a tab" >&2; exit 7 ;; esac
+          [ -n "${FAKE_CP_FAIL:-}" ] && exit 7
           cat "${FAKE_OBJECT:?}" ;;
 esac
 PAWS
@@ -578,6 +579,16 @@ out=$(FAKE_KEYS= "$POLLER" 2>&1); rc=$?
 check "an empty prefix is a clean run, not a failure" 0 $rc
 check "an empty prefix reports nothing new" yes "$(printf '%s' "$out" | grep -q 'no new alerts' && echo yes || echo no)"
 check "the poller does not call s3 ls (which cannot report an empty prefix)" 0 "$(code "$POLLER" | grep -c 's3 ls')"
+
+# `--output text` joins a LIST with TABS on one line, so two objects arrive as
+# "key1<TAB>key2". Read as a single key that is a download of a filename with a tab in
+# it -- correct with one object in the bucket, broken with two, which is exactly how
+# this shipped: the run that proved it listed one object.
+rm -rf "$PL/state"
+out=$(FAKE_KEYS=$'alerts/msh-ca-21/aaa.json.age\talerts/msh-ca-21/bbb.json.age' "$POLLER" 2>&1); rc=$?
+check "two tab-separated keys on one line are read as two objects" 0 $rc
+check "both objects are printed" 2 "$(printf '%s' "$out" | grep -c 'marshall-live: 2 hard errors')"
+check "neither is reported as a download failure" 0 "$(printf '%s' "$out" | grep -c 'download FAILED')"
 CMESH_ALERT_S3_BUCKET="" "$POLLER" >/dev/null 2>&1
 check "a missing bucket is a hard error, not a silent no-op" 1 $?
 
