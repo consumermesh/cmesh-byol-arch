@@ -154,6 +154,7 @@ put limits-50-cmesh-core.conf     /etc/security/limits.d/50-cmesh-core.conf    0
 put profile-cmesh-tmout.sh        /etc/profile.d/cmesh-tmout.sh                0644
 put sudoers-10-cmesh-wheel        /etc/sudoers.d/10-cmesh-wheel                0440
 put sshguard.conf                 /etc/sshguard.conf                           0644
+put sshguard.whitelist            /etc/sshguard/whitelist.example              0644
 put smartd.conf                   /etc/smartd.conf                             0644
 put mdmonitor-override.conf       /etc/systemd/system/mdmonitor.service.d/override.conf 0644
 put audit-50-cmesh-hipaa.rules    /etc/audit/rules.d/50-cmesh-hipaa.rules      0640
@@ -192,6 +193,21 @@ else
     ok "installed /etc/cmesh-byol/alert.env (delivery off until you edit it)"
 fi
 chmod 0600 /etc/cmesh-byol/alert.env
+
+# The sshguard whitelist is operator data for the same reason: it names the addresses
+# that must never be banned, and a re-run must not drop them. Ship the template, seed
+# the live file only on a host that has none, and leave later edits alone. Without a
+# whitelist a client that loops on a failed key bans the operator's own address --
+# THRESHOLD=30 is three failed auths for 2 minutes, doubling, then permanent at 120
+# points in /var/db/sshguard/blacklist.db -- and the ban is keyed on the source address,
+# so it takes everyone behind the same NAT with it.
+install -d -m 0755 /etc/sshguard
+if [ -f /etc/sshguard/whitelist ]; then
+    ok "kept /etc/sshguard/whitelist (already configured)"
+else
+    install -m 0644 "$FILES/sshguard.whitelist" /etc/sshguard/whitelist
+    ok "installed /etc/sshguard/whitelist (add your management egress)"
+fi
 
 # The sudo I/O log directory and the alert log must not be world-readable.
 install -d -m 0700 /var/log/sudo-io

@@ -1,0 +1,19 @@
+# cmesh BYOL hardening — sshguard never-block list (installed as /etc/sshguard/whitelist)
+#
+# Addresses listed here are never blocked by sshguard, whatever they do. Put your own
+# management egress here — office, VPN pool, bastion — so a client that fails SSH
+# authentication in a loop cannot lock you out of the host.
+#
+# Why this matters: a failed public-key attempt scores 10 and THRESHOLD is 30, so three
+# of them inside DETECTION_TIME earn a 2-minute ban. Repeat bans double, and 120 points
+# of history is a permanent entry in /var/db/sshguard/blacklist.db, which sshguard never
+# lifts, even across restarts. The ban is keyed on the source address, so one bad script
+# behind a NAT locks out everyone behind the same address.
+#
+# One address, CIDR block, or hostname per line; '#' starts a comment. Hostnames are
+# resolved once, at sshguard startup. cmesh-byol-harden seeds this file only when it is
+# absent, so edits here survive a re-run.
+#
+# Examples — replace with your own and uncomment:
+#   203.0.113.7/32        # office egress
+#   198.51.100.0/24       # VPN pool
